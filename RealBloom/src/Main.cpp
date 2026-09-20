@@ -1971,7 +1971,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
             else
             {
-                if (ImGui::SliderFloat2("Crop##CropResize", &params.cropResize.crop[0], 0.01f, 1.0f))
+                if (imGuiSliderFloat2W("Crop##CropResize", &params.cropResize.crop[0], 0.01f, 1.0f))
                 {
                     params.cropResize.crop[0] = std::clamp(params.cropResize.crop[0], 0.01f, 1.0f);
                     params.cropResize.crop[1] = std::clamp(params.cropResize.crop[1], 0.01f, 1.0f);
@@ -2000,7 +2000,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
             else
             {
-                if (ImGui::SliderFloat2("Resize##CropResize", &params.cropResize.resize[0], 0.01f, 2.0f))
+                if (imGuiSliderFloat2W("Resize##CropResize", &params.cropResize.resize[0], 0.01f, 2.0f))
                 {
                     params.cropResize.resize[0] = std::max(params.cropResize.resize[0], 0.01f);
                     params.cropResize.resize[1] = std::max(params.cropResize.resize[1], 0.01f);
@@ -2009,7 +2009,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
 
             // Origin
-            if (ImGui::SliderFloat2("Origin##CropResize", params.cropResize.origin.data(), 0.0f, 1.0f))
+            if (imGuiSliderFloat2W("Origin##CropResize", params.cropResize.origin.data(), 0.0f, 1.0f))
             {
                 params.cropResize.origin[0] = std::clamp(params.cropResize.origin[0], 0.0f, 1.0f);
                 params.cropResize.origin[1] = std::clamp(params.cropResize.origin[1], 0.0f, 1.0f);
@@ -2055,7 +2055,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
             else
             {
-                if (ImGui::SliderFloat2("Scale##Transform", &params.transform.scale[0], 0.01f, 2.0f))
+                if (imGuiSliderFloat2W("Scale##Transform", &params.transform.scale[0], 0.01f, 2.0f))
                 {
                     changed = true;
                 }
@@ -2066,11 +2066,11 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
                 changed = true;
 
             // Translate
-            if (ImGui::SliderFloat2("Translate##Transform", params.transform.translate.data(), -1.0f, 1.0f))
+            if (imGuiSliderFloat2W("Translate##Transform", params.transform.translate.data(), -1.0f, 1.0f))
                 changed = true;
 
             // Origin
-            if (ImGui::SliderFloat2("Origin##Transform", params.transform.origin.data(), 0.0f, 1.0f))
+            if (imGuiSliderFloat2W("Origin##Transform", params.transform.origin.data(), 0.0f, 1.0f))
             {
                 params.transform.origin[0] = std::clamp(params.transform.origin[0], 0.0f, 1.0f);
                 params.transform.origin[1] = std::clamp(params.transform.origin[1], 0.0f, 1.0f);
@@ -2275,9 +2275,101 @@ static bool imGuiDefaultReset(float* v, float vDefault)
 }
 
 // ImGui::SliderFloat + mouse wheel and default-reset support
+// Blender-style gauge: the track fills from the left in proportion to the value,
+// rather than showing a grab handle.
+//
+// The fill is drawn underneath and ImGui is left to do the behaviour, with its
+// own frame and grab made transparent. That keeps drag, Ctrl+Click to type, and
+// everything else intact instead of reimplementing SliderBehavior.
+static void imGuiGaugeBegin(float fraction, const char* label)
+{
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float w = ImGui::CalcItemWidth();
+    const float h = ImGui::GetFrameHeight();
+    const float rounding = ImGui::GetStyle().FrameRounding;
+    const ImVec2 p1(p0.x + w, p0.y + h);
+
+    // While typing a value the fill would sit behind the text, so drop it
+    const bool typing = ImGui::TempInputIsActive(ImGui::GetID(label));
+    const bool hovered = ImGui::IsMouseHoveringRect(p0, p1);
+
+    drawList->AddRectFilled(p0, p1,
+        ImGui::GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg), rounding);
+
+    if (!typing && (fraction > 0.0f))
+    {
+        const float fillW = ImMax(w * ImClamp(fraction, 0.0f, 1.0f), rounding * 2.0f);
+        drawList->PushClipRect(p0, p1, true);
+        drawList->AddRectFilled(p0, ImVec2(p0.x + fillW, p1.y),
+            ImGui::GetColorU32(ImGuiCol_SliderGrab), rounding);
+        drawList->PopClipRect();
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0, 0, 0, 0));
+}
+
+static void imGuiGaugeEnd()
+{
+    ImGui::PopStyleColor(5);
+}
+
+// Two-axis variant. ImGui splits the item width into equal components, so the
+// fills are drawn at the same offsets to keep them visually identical.
+bool imGuiSliderFloat2W(const char* label, float* v, float vMin, float vMax)
+{
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float spacing = style.ItemInnerSpacing.x;
+    const float wEach = (ImGui::CalcItemWidth() - spacing) / 2.0f;
+    const float h = ImGui::GetFrameHeight();
+    const float rounding = style.FrameRounding;
+
+    for (int i = 0; i < 2; i++)
+    {
+        const ImVec2 a(p0.x + (float)i * (wEach + spacing), p0.y);
+        const ImVec2 b(a.x + wEach, a.y + h);
+        const bool hovered = ImGui::IsMouseHoveringRect(a, b);
+
+        drawList->AddRectFilled(a, b,
+            ImGui::GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg), rounding);
+
+        const float frac = (vMax > vMin)
+            ? ImClamp((v[i] - vMin) / (vMax - vMin), 0.0f, 1.0f) : 0.0f;
+        if (frac > 0.0f)
+        {
+            const float fillW = ImMax(wEach * frac, rounding * 2.0f);
+            drawList->PushClipRect(a, b, true);
+            drawList->AddRectFilled(a, ImVec2(a.x + fillW, b.y),
+                ImGui::GetColorU32(ImGuiCol_SliderGrab), rounding);
+            drawList->PopClipRect();
+        }
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0, 0, 0, 0));
+    const bool changed = ImGui::SliderFloat2(label, v, vMin, vMax);
+    ImGui::PopStyleColor(5);
+
+    return changed;
+}
+
 bool imGuiSliderFloatW(const char* label, float* v, float vMin, float vMax, float vDefault)
 {
+    const float frac = (vMax > vMin) ? ((*v - vMin) / (vMax - vMin)) : 0.0f;
+
+    imGuiGaugeBegin(frac, label);
     bool changed = ImGui::SliderFloat(label, v, vMin, vMax);
+    imGuiGaugeEnd();
+
     if (imGuiWheelAdjust(v, vMin, vMax))
         changed = true;
     if (imGuiDefaultReset(v, vDefault))
@@ -2288,7 +2380,13 @@ bool imGuiSliderFloatW(const char* label, float* v, float vMin, float vMax, floa
 bool imGuiSliderUInt(const std::string& label, uint32_t* v, uint32_t min, uint32_t max, uint32_t vDefault)
 {
     int vInt = u32ToI32(*v);
+
+    const float frac = (max > min)
+        ? ((float)(*v - min) / (float)(max - min)) : 0.0f;
+
+    imGuiGaugeBegin(frac, label.c_str());
     bool changed = ImGui::SliderInt(label.c_str(), &vInt, u32ToI32(min), u32ToI32(max));
+    imGuiGaugeEnd();
 
     // Mouse wheel: 1% of the range per notch, but never less than 1
     if (wheelEditAllowed())

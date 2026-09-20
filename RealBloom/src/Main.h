@@ -95,6 +95,7 @@ void imGuiBold(const std::string& s);
 void imGuiText(const std::string& s, bool isError, bool newLine);
 bool imGuiWheelAdjust(float* v, float vMin, float vMax);
 bool imGuiSliderFloatW(const char* label, float* v, float vMin, float vMax, float vDefault = FLT_MAX);
+bool imGuiSliderFloat2W(const char* label, float* v, float vMin, float vMax);
 bool imGuiSliderUInt(const std::string& label, uint32_t* v, uint32_t min, uint32_t max, uint32_t vDefault = UINT32_MAX);
 bool imGuiInputUInt(const std::string& label, uint32_t* v);
 bool imGuiCombo(const std::string& label, const std::vector<std::string>& items, int* selectedIndex, bool fullWidth);
