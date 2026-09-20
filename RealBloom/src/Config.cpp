@@ -19,17 +19,45 @@ const char* Config::DOCS_URL = "https://github.com/bean-mhm/realbloom/blob/main/
 // Variable
 float Config::UI_SCALE = 1.0f;
 
-std::map<std::string, int> Config::UI_STATE;
+std::map<std::string, std::string> Config::UI_STATE;
 
-int Config::getUIState(const std::string& key, int defaultValue)
+std::string Config::getUIString(const std::string& key, const std::string& defaultValue)
 {
     const auto it = UI_STATE.find(key);
     return (it == UI_STATE.end()) ? defaultValue : it->second;
 }
 
-void Config::setUIState(const std::string& key, int value)
+void Config::setUIString(const std::string& key, const std::string& value)
 {
     UI_STATE[key] = value;
+}
+
+int Config::getUIState(const std::string& key, int defaultValue)
+{
+    const auto it = UI_STATE.find(key);
+    if (it == UI_STATE.end())
+        return defaultValue;
+    try { return std::stoi(it->second); }
+    catch (const std::exception&) { return defaultValue; }
+}
+
+void Config::setUIState(const std::string& key, int value)
+{
+    UI_STATE[key] = strFormat("%d", value);
+}
+
+float Config::getUIFloat(const std::string& key, float defaultValue)
+{
+    const auto it = UI_STATE.find(key);
+    if (it == UI_STATE.end())
+        return defaultValue;
+    try { return std::stof(it->second); }
+    catch (const std::exception&) { return defaultValue; }
+}
+
+void Config::setUIFloat(const std::string& key, float value)
+{
+    UI_STATE[key] = strFormat("%f", value);
 }
 
 void Config::load()
@@ -75,7 +103,7 @@ void Config::load()
             {
                 const std::string name = item.attribute("name").as_string();
                 if (!name.empty())
-                    UI_STATE[name] = item.attribute("value").as_int(0);
+                    UI_STATE[name] = item.attribute("value").as_string("");
             }
         }
     }
@@ -116,7 +144,7 @@ void Config::save()
             {
                 pugi::xml_node item = stateNode.append_child("Item");
                 item.append_attribute("name").set_value(kv.first.c_str());
-                item.append_attribute("value").set_value(kv.second);
+                item.append_attribute("value").set_value(kv.second.c_str());
             }
         }
 
