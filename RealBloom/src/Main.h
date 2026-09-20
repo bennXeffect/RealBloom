@@ -26,6 +26,7 @@
 #include <GL/glew.h>
 
 #include "imgui/imgui.h"
+#include "imgui/imgui_internal.h"
 #include "imgui/imgui_impl_glfw.h"
 #include "imgui/imgui_impl_opengl3.h"
 #include <GLFW/glfw3.h> // Will drag system OpenGL headers
@@ -92,6 +93,8 @@ void imGuiDiv();
 void imGuiHorzDiv();
 void imGuiBold(const std::string& s);
 void imGuiText(const std::string& s, bool isError, bool newLine);
+bool imGuiWheelAdjust(float* v, float vMin, float vMax);
+bool imGuiSliderFloatW(const char* label, float* v, float vMin, float vMax);
 bool imGuiSliderUInt(const std::string& label, uint32_t* v, uint32_t min, uint32_t max);
 bool imGuiInputUInt(const std::string& label, uint32_t* v);
 bool imGuiCombo(const std::string& label, const std::vector<std::string>& items, int* selectedIndex, bool fullWidth);

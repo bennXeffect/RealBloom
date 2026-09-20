@@ -23,6 +23,8 @@ static ImFont* fontMono = nullptr;
 static const ImVec4 colorBackground{ 0.13f, 0.13f, 0.13f, 1.00f };
 static const ImVec4 colorImageBorder{ 0.05f, 0.05f, 0.05f, 1.0f };
 static const ImVec4 colorInfoText{ 0.328f, 0.735f, 0.910f, 1.0f };
+static const ImVec4 colorPaneSelected{ 0.16f, 0.29f, 0.36f, 1.0f };
+static const ImVec4 colorPaneNormal{ 0.10f, 0.10f, 0.10f, 1.0f };
 static const ImVec4 colorWarningText{ 0.940f, 0.578f, 0.282f, 1.0f };
 static const ImVec4 colorErrorText{ 0.950f, 0.300f, 0.228f, 1.0f };
 
@@ -34,6 +36,19 @@ std::vector<uint32_t> loadableSlotIndices;
 static int selSlotIndex = 0;
 static std::string selSlotID = ""; // will be updated externally, causing the index to update
 static float imageZoom = 1.0f;
+static ImVec2 imagePan{ 0.0f, 0.0f };   // single-view offset, in screen pixels
+static constexpr float IMAGE_ZOOM_MIN = 0.05f;
+static constexpr float IMAGE_ZOOM_MAX = 8.0f;
+
+// Image viewer layout
+static bool viewerSplit = true;        // show every slot at once
+static int viewerHoveredSlot = -1;     // slot under the cursor, used as the drag-drop target
+static std::vector<ImVec4> viewerSlotRects; // on-screen rect per slot, for drop targeting
+
+// Slot-to-slot drag and drop
+static constexpr const char* SLOT_DND_TYPE = "RB_SLOT";
+static int pendingMoveSrc = -1;
+static int pendingMoveDst = -1;
 
 // RealBloom modules
 static RealBloom::Diffraction diff;
@@ -320,6 +335,185 @@ void layoutAll()
     layoutDebug();
 }
 
+// Copy or move one slot's image into another. Same semantics as the Move To
+// dialog: modules read from their internal image, so prefer that when present.
+static void moveSlotContent(int srcIndex, int dstIndex, bool preserveOriginal)
+{
+    if ((srcIndex < 0) || (dstIndex < 0) || (srcIndex == dstIndex))
+        return;
+    if ((srcIndex >= (int)slots.size()) || (dstIndex >= (int)slots.size()))
+        return;
+
+    ImageSlot& src = slots[srcIndex];
+    ImageSlot& dst = slots[dstIndex];
+    if (!dst.canLoad)
+        return;
+
+    if (dst.internalImage != nullptr)
+    {
+        src.viewImage->moveContent(*dst.internalImage, preserveOriginal);
+        dst.indicateUpdate();
+    }
+    else
+    {
+        src.viewImage->moveContent(*dst.viewImage, preserveOriginal);
+    }
+
+    selSlotID = dst.id;
+}
+
+// Right-click menu shared by the split panes and the single view.
+static void layoutSlotContextMenu(int slotIndex)
+{
+    ImageSlot& slot = slots[slotIndex];
+
+    if (!ImGui::BeginPopupContextWindow("##SlotContext"))
+        return;
+
+    // Right-clicking a pane also makes it the active slot
+    selSlotIndex = slotIndex;
+
+    ImGui::PushFont(fontRobotoBold);
+    ImGui::TextUnformatted(slot.name.c_str());
+    ImGui::PopFont();
+    ImGui::Separator();
+
+    const bool hasImage = (slot.viewImage->getWidth() > 1)
+        || (slot.viewImage->getHeight() > 1);
+
+    if (slot.canLoad && ImGui::MenuItem("Browse..."))
+    {
+        try { browseImageForSlot(slot); }
+        catch (const std::exception& e) { printError(__FUNCTION__, "", e.what()); }
+    }
+
+    if (ImGui::MenuItem("Save...", nullptr, false, hasImage))
+    {
+        try { saveImageFromSlot(slot); }
+        catch (const std::exception& e) { printError(__FUNCTION__, "", e.what()); }
+    }
+
+    ImGui::Separator();
+
+    if (ImGui::MenuItem("Clear", nullptr, false, hasImage))
+    {
+        slot.viewImage->reset(true);
+        if (slot.internalImage != nullptr)
+        {
+            slot.internalImage->reset(true);
+            slot.indicateUpdate();
+        }
+    }
+
+    ImGui::EndPopup();
+}
+
+// One pane of the split image viewer: the slot name plus its image fitted
+// into the cell. Returns true if the pane was double-clicked.
+static bool layoutSlotPane(int slotIndex, const ImVec2& cellSize)
+{
+    ImageSlot& slot = slots[slotIndex];
+    const bool isSelected = (slotIndex == selSlotIndex);
+    bool doubleClicked = false;
+
+    ImGui::PushID(slotIndex);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, isSelected ? colorPaneSelected : colorPaneNormal);
+    ImGui::BeginChild("##SlotPane", cellSize, true,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    // Remember where this pane sits so a dropped file can target it
+    const ImVec2 paneMin = ImGui::GetWindowPos();
+    viewerSlotRects[slotIndex] = ImVec4(
+        paneMin.x, paneMin.y, paneMin.x + cellSize.x, paneMin.y + cellSize.y);
+
+    ImGui::PushFont(isSelected ? fontRobotoBold : fontRoboto);
+    ImGui::TextWrapped(slot.name.c_str());
+    ImGui::PopFont();
+
+    const uint32_t w = slot.viewImage->getWidth();
+    const uint32_t h = slot.viewImage->getHeight();
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+
+    if (((w > 1) || (h > 1)) && (avail.x > 0.0f) && (avail.y > 0.0f))
+    {
+        // Fit the image into the cell, preserving aspect ratio
+        const float fit = std::max(0.0f,
+            std::min(avail.x / (float)w, avail.y / (float)h));
+        const ImVec2 drawSize((float)w * fit, (float)h * fit);
+
+        const ImVec2 cur = ImGui::GetCursorPos();
+        ImGui::SetCursorPos(ImVec2(
+            cur.x + std::max(0.0f, (avail.x - drawSize.x) * 0.5f),
+            cur.y + std::max(0.0f, (avail.y - drawSize.y) * 0.5f)));
+
+        ImGui::Image(
+            (void*)(intptr_t)(slot.viewImage->getGlTexture()),
+            drawSize, { 0, 0 }, { 1, 1 }, { 1, 1, 1, 1 }, colorImageBorder);
+
+        // Only a slot holding an image can be dragged. ImGui::Image submits no ID,
+        // hence SourceAllowNullID.
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID))
+        {
+            ImGui::SetDragDropPayload(SLOT_DND_TYPE, &slotIndex, sizeof(int));
+            ImGui::PushFont(fontRobotoBold);
+            ImGui::TextUnformatted(slot.name.c_str());
+            ImGui::PopFont();
+            ImGui::TextDisabled("Drop on a slot to copy, Shift to move");
+            ImGui::EndDragDropSource();
+        }
+    }
+    else
+    {
+        ImGui::PushFont(fontMono);
+        ImGui::TextDisabled("(empty)");
+        ImGui::PopFont();
+    }
+
+    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem))
+    {
+        viewerHoveredSlot = slotIndex;
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            selSlotIndex = slotIndex;
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+            doubleClicked = true;
+    }
+
+    // Drop target spans the whole pane, not just the image, so an empty slot can
+    // still receive one.
+    if (slot.canLoad)
+    {
+        const ImRect paneRect(
+            ImVec2(paneMin.x + 1.0f, paneMin.y + 1.0f),
+            ImVec2(paneMin.x + cellSize.x - 1.0f, paneMin.y + cellSize.y - 1.0f));
+
+        if (ImGui::BeginDragDropTargetCustom(paneRect, ImGui::GetID("##SlotDrop")))
+        {
+            const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(
+                SLOT_DND_TYPE, ImGuiDragDropFlags_AcceptNoDrawDefaultRect);
+
+            ImGui::GetWindowDrawList()->AddRect(
+                paneRect.Min, paneRect.Max,
+                ImGui::GetColorU32(ImGuiCol_DragDropTarget), 0.0f, 0, 2.5f);
+
+            if (payload != nullptr)
+            {
+                pendingMoveSrc = *(const int*)payload->Data;
+                pendingMoveDst = slotIndex;
+            }
+
+            ImGui::EndDragDropTarget();
+        }
+    }
+
+    layoutSlotContextMenu(slotIndex);
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::PopID();
+
+    return doubleClicked;
+}
+
 void layoutImagePanels()
 {
     // See if selSlotID needs to be updated
@@ -353,6 +547,16 @@ void layoutImagePanels()
     {
         selSlot.viewImage->moveToGPU();
         lastSelSlotIndex = selSlotIndex;
+        imagePan = ImVec2(0.0f, 0.0f);
+
+        // Bring the module panel that owns this slot to the front, so the
+        // visible tab always matches the slot being worked on.
+        if (selSlot.id.rfind("diff-", 0) == 0)
+            ImGui::SetWindowFocus("Diffraction");
+        else if (selSlot.id.rfind("disp-", 0) == 0)
+            ImGui::SetWindowFocus("Dispersion");
+        else if (selSlot.id.rfind("cv-", 0) == 0)
+            ImGui::SetWindowFocus("Convolution");
     }
 
     // Image List
@@ -406,6 +610,9 @@ void layoutImagePanels()
             ImGui::EndDisabled();
         }
 
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("A/B flip between this module's input and result. Only available on input/result slots.");
+
         // Move To
         if (ImGui::Button("Move To##ImageSlots", btnSize()))
         {
@@ -426,6 +633,9 @@ void layoutImagePanels()
             ImGui::OpenPopup(DIALOG_TITLE_MOVETO);
         }
 
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Copy this image into another slot. Easier: drag one pane onto another in the viewer. This is how modules chain, e.g. Diffraction Result -> Conv. Kernel.");
+
         ImGui::NewLine();
         imGuiDialogs();
         ImGui::End();
@@ -433,7 +643,10 @@ void layoutImagePanels()
 
     // Image Viewer
     {
-        ImGui::Begin("Image Viewer", 0, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGuiWindowFlags viewerFlags = ImGuiWindowFlags_NoScrollWithMouse;
+        if (!viewerSplit)
+            viewerFlags |= ImGuiWindowFlags_NoScrollbar;
+        ImGui::Begin("Image Viewer", 0, viewerFlags);
 
         // Name
 
@@ -460,12 +673,15 @@ void layoutImagePanels()
         {
             ImGui::SameLine();
             ImGui::PushItemWidth(70.0f * Config::UI_SCALE);
-            ImGui::DragFloat("##ImageViewer_Zoom", &imageZoom, 0.005f, 0.1f, 2.0f, "%.2f", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat);
+            ImGui::DragFloat("##ImageViewer_Zoom", &imageZoom, 0.005f, IMAGE_ZOOM_MIN, IMAGE_ZOOM_MAX, "%.2f", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat);
             ImGui::PopItemWidth();
 
             ImGui::SameLine();
             if (ImGui::SmallButton("R##ImageViewer"))
+            {
                 imageZoom = 1.0f;
+                imagePan = ImVec2(0.0f, 0.0f);
+            }
         }
 
         imGuiHorzDiv();
@@ -524,20 +740,160 @@ void layoutImagePanels()
             }
         }
 
+        // Split / single view toggle
+        ImGui::SameLine();
+        if (ImGui::SmallButton(viewerSplit ? "Single##ImageViewer" : "Split##ImageViewer"))
+        {
+            viewerSplit = !viewerSplit;
+            imagePan = ImVec2(0.0f, 0.0f);
+        }
+
         ImGui::PopFont();
 
         // Show IO Error
         if (getElapsedMs(ioErrorTime) > 5000) ioError = "";
         if (!ioError.empty()) imGuiText(ioError, true, false);
 
-        // Image
-        ImGui::Image(
-            (void*)(intptr_t)(selSlot.viewImage->getGlTexture()),
-            ImVec2((float)imageWidth * imageZoom, (float)imageHeight * imageZoom),
-            { 0, 0 },
-            { 1, 1 },
-            { 1, 1, 1, 1 },
-            colorImageBorder);
+        // Images
+        if (viewerSlotRects.size() != slots.size())
+            viewerSlotRects.assign(slots.size(), ImVec4(0, 0, 0, 0));
+        else
+            std::fill(viewerSlotRects.begin(), viewerSlotRects.end(), ImVec4(0, 0, 0, 0));
+        viewerHoveredSlot = -1;
+
+        if (viewerSplit)
+        {
+            // Every slot at once. Column count adapts to the panel width.
+            const ImVec2 avail = ImGui::GetContentRegionAvail();
+            const ImVec2 spacing = ImGui::GetStyle().ItemSpacing;
+            const float minCellW = 190.0f * Config::UI_SCALE;
+
+            const int count = (int)slots.size();
+            const int cols = std::clamp((int)(avail.x / minCellW), 1, 4);
+            const int rows = (count + cols - 1) / cols;
+
+            const ImVec2 cell(
+                (avail.x - spacing.x * (float)(cols - 1)) / (float)cols,
+                std::max(90.0f * Config::UI_SCALE,
+                    (avail.y - spacing.y * (float)(rows - 1)) / (float)rows));
+
+            for (int i = 0; i < count; i++)
+            {
+                if ((i % cols) != 0)
+                    ImGui::SameLine();
+
+                // Double-clicking a pane blows it up to fill the viewer
+                if (layoutSlotPane(i, cell))
+                {
+                    viewerSplit = false;
+                    imagePan = ImVec2(0.0f, 0.0f);
+                }
+            }
+        }
+        else
+        {
+            // Single slot: an explicit pan/zoom canvas.
+            //
+            // Position comes from imagePan rather than the window scroll. SetScrollX
+            // only takes effect at the next Begin(), so the scale changed a frame
+            // before its anchoring correction landed and the image visibly jumped
+            // while the wheel turned. Moving the image ourselves puts both in the
+            // same frame.
+            ImGui::BeginChild("##ImageCanvas", ImVec2(0.0f, 0.0f), false,
+                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+            const ImVec2 base = ImGui::GetCursorScreenPos();
+            const ImVec2 canvas = ImGui::GetContentRegionAvail();
+            viewerSlotRects[selSlotIndex] = ImVec4(
+                base.x, base.y, base.x + canvas.x, base.y + canvas.y);
+
+            if (ImGui::IsWindowHovered())
+            {
+                viewerHoveredSlot = selSlotIndex;
+
+                // Wheel zoom anchored on the cursor. p is the image point under the
+                // pointer in unzoomed pixels; holding it still across oldZoom ->
+                // newZoom means shifting the image by -p * (newZoom - oldZoom).
+                const float wheel = ImGui::GetIO().MouseWheel;
+                if (wheel != 0.0f)
+                {
+                    const float oldZoom = imageZoom;
+                    const float newZoom = std::clamp(
+                        oldZoom * powf(1.15f, wheel), IMAGE_ZOOM_MIN, IMAGE_ZOOM_MAX);
+
+                    if (newZoom != oldZoom)
+                    {
+                        const ImVec2 mouse = ImGui::GetIO().MousePos;
+                        const float px = (mouse.x - (base.x + imagePan.x)) / oldZoom;
+                        const float py = (mouse.y - (base.y + imagePan.y)) / oldZoom;
+                        const float dz = newZoom - oldZoom;
+
+                        imagePan.x -= px * dz;
+                        imagePan.y -= py * dz;
+                        imageZoom = newZoom;
+                    }
+                }
+
+                // Drag with left or middle to pan
+                if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f)
+                    || ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 2.0f))
+                {
+                    const ImVec2 delta = ImGui::GetIO().MouseDelta;
+                    imagePan.x += delta.x;
+                    imagePan.y += delta.y;
+                }
+
+                // A middle click restores 1:1, but only if it was a click and not
+                // the end of a pan drag.
+                if (ImGui::IsMouseReleased(ImGuiMouseButton_Middle))
+                {
+                    const ImVec2 d = ImGui::GetMouseDragDelta(ImGuiMouseButton_Middle, 0.0f);
+                    if ((fabsf(d.x) + fabsf(d.y)) < 4.0f)
+                    {
+                        imageZoom = 1.0f;
+                        imagePan = ImVec2(0.0f, 0.0f);
+                    }
+                }
+
+                // Double click returns to the split view
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    viewerSplit = true;
+            }
+
+            const ImVec2 drawSize(
+                (float)imageWidth * imageZoom, (float)imageHeight * imageZoom);
+
+            // Keep a sliver of the image on screen so it cannot be lost entirely
+            {
+                const float margin = 32.0f * Config::UI_SCALE;
+                const float loX = margin - drawSize.x, hiX = canvas.x - margin;
+                const float loY = margin - drawSize.y, hiY = canvas.y - margin;
+                if (loX <= hiX) imagePan.x = std::min(std::max(imagePan.x, loX), hiX);
+                if (loY <= hiY) imagePan.y = std::min(std::max(imagePan.y, loY), hiY);
+            }
+
+            ImGui::SetCursorScreenPos(ImVec2(base.x + imagePan.x, base.y + imagePan.y));
+            ImGui::Image(
+                (void*)(intptr_t)(selSlot.viewImage->getGlTexture()),
+                drawSize,
+                { 0, 0 },
+                { 1, 1 },
+                { 1, 1, 1, 1 },
+                colorImageBorder);
+
+            ImGui::EndChild();
+
+            layoutSlotContextMenu(selSlotIndex);
+        }
+
+        // Applied after every pane is drawn, so nothing mutates mid-iteration.
+        // Shift drops move the image, a plain drop copies it.
+        if ((pendingMoveSrc >= 0) && (pendingMoveDst >= 0))
+        {
+            moveSlotContent(pendingMoveSrc, pendingMoveDst, !ImGui::GetIO().KeyShift);
+            pendingMoveSrc = -1;
+            pendingMoveDst = -1;
+        }
 
         ImGui::End();
     }
@@ -558,7 +914,7 @@ void layoutColorManagement()
 
         // Exposure
         float cmsExposure = CMS::getExposure();
-        if (ImGui::SliderFloat("Exposure##CMS", &cmsExposure, -EXPOSURE_RANGE, EXPOSURE_RANGE))
+        if (imGuiSliderFloatW("Exposure##CMS", &cmsExposure, -EXPOSURE_RANGE, EXPOSURE_RANGE))
         {
             CMS::setExposure(cmsExposure);
             cmsParamsChanged = true;
@@ -850,7 +1206,12 @@ void layoutMisc()
 
     imGuiBold("INTERFACE");
 
-    if (ImGui::SliderFloat("Scale##Misc", &Config::UI_SCALE, Config::UI_MIN_SCALE, Config::UI_MAX_SCALE))
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+    ImGui::TextWrapped("Tip: Ctrl+Click any slider to type an exact value. Mouse wheel over a slider nudges it by 1%%.");
+    ImGui::PopStyleColor();
+
+
+    if (imGuiSliderFloatW("Scale##Misc", &Config::UI_SCALE, Config::UI_MIN_SCALE, Config::UI_MAX_SCALE))
     {
         Config::UI_SCALE = fminf(fmaxf(Config::UI_SCALE, Config::UI_MIN_SCALE), Config::UI_MAX_SCALE);
         io->FontGlobalScale = Config::UI_SCALE / Config::UI_MAX_SCALE;
@@ -956,13 +1317,13 @@ void layoutConvolution()
             convParams->methodInfo.NAIVE_GPU_chunkSleep = std::clamp(convParams->methodInfo.NAIVE_GPU_chunkSleep, 0u, RealBloom::CONV_NAIVE_GPU_MAX_SLEEP);
     }
 
-    if (ImGui::SliderFloat("Threshold##Conv", &convParams->threshold, 0.0f, 2.0f))
+    if (imGuiSliderFloatW("Threshold##Conv", &convParams->threshold, 0.0f, 2.0f))
     {
         convParams->threshold = std::max(convParams->threshold, 0.0f);
         convThresholdUpdated = true;
     }
 
-    if (ImGui::SliderFloat("Knee##Conv", &convParams->knee, 0.0f, 2.0f))
+    if (imGuiSliderFloatW("Knee##Conv", &convParams->knee, 0.0f, 2.0f))
     {
         convParams->knee = std::max(convParams->knee, 0.0f);
         convThresholdUpdated = true;
@@ -1035,13 +1396,13 @@ void layoutConvolution()
 
     if (convParams->blendAdditive)
     {
-        if (ImGui::SliderFloat("Input##Conv", &convParams->blendInput, 0.0f, 1.0f))
+        if (imGuiSliderFloatW("Input##Conv", &convParams->blendInput, 0.0f, 1.0f))
         {
             convParams->blendInput = std::max(convParams->blendInput, 0.0f);
             convBlendParamsUpdated = true;
         }
 
-        if (ImGui::SliderFloat("Conv.##Conv", &convParams->blendConv, 0.0f, 1.0f))
+        if (imGuiSliderFloatW("Conv.##Conv", &convParams->blendConv, 0.0f, 1.0f))
         {
             convParams->blendConv = std::max(convParams->blendConv, 0.0f);
             convBlendParamsUpdated = true;
@@ -1049,14 +1410,14 @@ void layoutConvolution()
     }
     else
     {
-        if (ImGui::SliderFloat("Mix##Conv", &convParams->blendMix, 0.0f, 1.0f))
+        if (imGuiSliderFloatW("Mix##Conv", &convParams->blendMix, 0.0f, 1.0f))
         {
             convParams->blendMix = std::clamp(convParams->blendMix, 0.0f, 1.0f);
             convBlendParamsUpdated = true;
         }
     }
 
-    if (ImGui::SliderFloat("Exposure##Conv", &convParams->blendExposure, -EXPOSURE_RANGE, EXPOSURE_RANGE))
+    if (imGuiSliderFloatW("Exposure##Conv", &convParams->blendExposure, -EXPOSURE_RANGE, EXPOSURE_RANGE))
         convBlendParamsUpdated = true;
 
     if (ImGui::Button("Show Conv. Layer##Conv", btnSize()))
@@ -1099,20 +1460,22 @@ void layoutDispersion()
     if (layoutImageTransformParams("Input", "DispInput", dispParams->inputTransformParams))
         dispInputUpdated = true;
 
+    bool dispInputChanged = false;
     if (dispInputUpdated)
     {
         dispInputUpdated = false;
         disp.previewInput();
         selSlotID = "disp-input";
+        dispInputChanged = true;
     }
 
     imGuiDiv();
     imGuiBold("DISPERSION");
 
-    if (ImGui::SliderFloat("Amount##Disp", &dispParams->amount, 0.0f, 1.0f))
+    if (imGuiSliderFloatW("Amount##Disp", &dispParams->amount, 0.0f, 1.0f))
         dispParams->amount = fmaxf(dispParams->amount, 0.0f);
 
-    if (ImGui::SliderFloat("Edge Offset##Disp", &dispParams->edgeOffset, -1.0f, 1.0f))
+    if (imGuiSliderFloatW("Edge Offset##Disp", &dispParams->edgeOffset, -1.0f, 1.0f))
         dispParams->edgeOffset = std::clamp(dispParams->edgeOffset, -1.0f, 1.0f);
 
     if (imGuiSliderUInt("Steps##Disp", &dispParams->steps, 32, 1024))
@@ -1128,15 +1491,80 @@ void layoutDispersion()
             dispParams->methodInfo.numThreads = std::clamp(dispParams->methodInfo.numThreads, 1u, getMaxNumThreads());
     }
 
-    if (ImGui::Button("Apply Dispersion##Disp", btnSize()))
+    // Live preview.
+    // Dispersion is cheap at low step counts, so re-run it automatically once the
+    // parameters settle. Cost grows linearly with steps x pixels, and compute()
+    // cancels-and-joins any run in progress, so a heavy re-trigger would stall the
+    // UI. Past a budget the auto-run backs off and the button takes over.
+    static bool dispLive = true;
+    ImGui::Checkbox("Live##Disp", &dispLive);
+
+    const uint32_t dispInW = imgDispInput.getWidth();
+    const uint32_t dispInH = imgDispInput.getHeight();
+    const bool dispHasInput = (dispInW > 1) || (dispInH > 1);
+
+    const uint64_t dispCost =
+        (uint64_t)dispParams->steps * (uint64_t)dispInW * (uint64_t)dispInH;
+    const uint64_t dispBudget =
+        (dispParams->methodInfo.method == RealBloom::DispersionMethod::GPU)
+        ? 400000000ull : 100000000ull;
+    const bool dispTooHeavy = (dispCost > dispBudget);
+
+    auto applyDispersion = [&](bool focusResult)
     {
-        imgDispResult.resize(imgDispInput.getWidth(), imgDispInput.getHeight(), true);
+        imgDispResult.resize(dispInW, dispInH, true);
         imgDispResult.fill(std::array<float, 4>{ 0, 0, 0, 1 }, true);
         imgDispResult.moveToGPU();
-        selSlotID = "disp-result";
+
+        // A live re-run must not steal the selection; the split viewer already
+        // shows the result alongside the input.
+        if (focusResult)
+            selSlotID = "disp-result";
 
         disp.compute();
+    };
+
+    // Re-run once the parameters have been stable for a moment
+    {
+        static float lastAmount = FLT_MAX;
+        static float lastEdgeOffset = FLT_MAX;
+        static uint32_t lastSteps = 0;
+        static int lastMethod = -1;
+        static uint32_t lastW = 0;
+        static uint32_t lastH = 0;
+        static auto lastChangeTime = std::chrono::system_clock::now();
+        static bool pending = false;
+
+        if ((dispParams->amount != lastAmount)
+            || (dispParams->edgeOffset != lastEdgeOffset)
+            || (dispParams->steps != lastSteps)
+            || ((int)dispParams->methodInfo.method != lastMethod)
+            || (dispInW != lastW) || (dispInH != lastH)
+            || dispInputChanged)
+        {
+            lastAmount = dispParams->amount;
+            lastEdgeOffset = dispParams->edgeOffset;
+            lastSteps = dispParams->steps;
+            lastMethod = (int)dispParams->methodInfo.method;
+            lastW = dispInW;
+            lastH = dispInH;
+            lastChangeTime = std::chrono::system_clock::now();
+            pending = true;
+        }
+
+        if (pending && dispLive && dispHasInput && !dispTooHeavy
+            && (getElapsedMs(lastChangeTime) > 200))
+        {
+            pending = false;
+            applyDispersion(false);
+        }
     }
+
+    if (ImGui::Button("Apply Dispersion##Disp", btnSize()))
+        applyDispersion(true);
+
+    if (dispLive && dispHasInput && dispTooHeavy)
+        imGuiText("Live paused: too heavy at these settings. Use Apply.", false, false);
 
     if (disp.getStatus().isWorking())
     {
@@ -1173,9 +1601,84 @@ void layoutDiffraction()
     }
 
     imGuiDiv();
+    imGuiBold("OUTPUT");
+
+    // Explicit kernel resolution. Input Transform > Resize is the underlying
+    // control, but what you actually want to say is "give me a 512px kernel",
+    // so drive the multiplier from the target size instead of the other way round.
+    {
+        CmImage* diffInputSrc = diff.getImgInputSrc();
+        const uint32_t srcW = diffInputSrc->getWidth();
+        const uint32_t srcH = diffInputSrc->getHeight();
+
+        uint32_t croppedW = 1, croppedH = 1, resizedW = 1, resizedH = 1;
+        float cropX = 1.0f, cropY = 1.0f, resizeX = 1.0f, resizeY = 1.0f;
+        ImageTransform::getOutputDimensions(
+            diffParams->inputTransformParams, srcW, srcH,
+            croppedW, croppedH, cropX, cropY,
+            resizedW, resizedH, resizeX, resizeY);
+
+        static int reqW = 0;
+        static int reqH = 0;
+        static bool editing = false;
+
+        // Track the real size unless the user is mid-edit
+        if (!editing)
+        {
+            reqW = (int)resizedW;
+            reqH = (int)resizedH;
+        }
+
+        bool apply = false;
+        ImGui::PushItemWidth(90.0f * Config::UI_SCALE);
+        if (ImGui::InputInt("Width##DiffOut", &reqW, 0, 0,
+            ImGuiInputTextFlags_EnterReturnsTrue))
+            apply = true;
+        if (ImGui::InputInt("Height##DiffOut", &reqH, 0, 0,
+            ImGuiInputTextFlags_EnterReturnsTrue))
+            apply = true;
+        ImGui::PopItemWidth();
+
+        editing = ImGui::IsItemActive() || ImGui::IsItemFocused();
+
+        if (ImGui::Button("Apply Size##DiffOut", btnSize()))
+            apply = true;
+
+        if (apply && (srcW > 0) && (srcH > 0))
+        {
+            reqW = std::clamp(reqW, 4, 16384);
+            reqH = std::clamp(reqH, 4, 16384);
+
+            // Resize multiplies the CROPPED size, so derive it from that
+            diffParams->inputTransformParams.cropResize.resize[0] =
+                (float)reqW / (float)std::max(1u, croppedW);
+            diffParams->inputTransformParams.cropResize.resize[1] =
+                (float)reqH / (float)std::max(1u, croppedH);
+
+            diffInputUpdated = true;
+            editing = false;
+        }
+
+        // The FFT pads an even dimension by one so the pattern centre lands
+        // exactly on a pixel rather than straddling four.
+        const uint32_t fftW = (resizedW % 2 == 0) ? (resizedW + 1) : resizedW;
+        const uint32_t fftH = (resizedH % 2 == 0) ? (resizedH + 1) : resizedH;
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+        ImGui::TextWrapped("Source %ux%u -> kernel %ux%u", srcW, srcH, fftW, fftH);
+        ImGui::PopStyleColor();
+    }
+
+    imGuiDiv();
     imGuiBold("DIFFRACTION");
 
     ImGui::Checkbox("Logarithmic Normalization##Diff", &diffParams->logNorm);
+
+    // The pattern is the Fourier transform of the aperture, so aperture size and
+    // pattern size are reciprocal. This surprises people, so say it out loud.
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+    ImGui::TextWrapped("Scaling the aperture down widens the result, and vice versa (Fourier scaling).");
+    ImGui::PopStyleColor();
 
     if (ImGui::Button("Compute##Diff", btnSize()))
     {
@@ -1244,7 +1747,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
             if (lockCrop[imGuiID])
             {
-                if (ImGui::SliderFloat("Crop##CropResize", &params.cropResize.crop[0], 0.01f, 1.0f))
+                if (imGuiSliderFloatW("Crop##CropResize", &params.cropResize.crop[0], 0.01f, 1.0f))
                 {
                     params.cropResize.crop[0] = std::clamp(params.cropResize.crop[0], 0.01f, 1.0f);
                     params.cropResize.crop[1] = params.cropResize.crop[0];
@@ -1273,7 +1776,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
             if (lockResize[imGuiID])
             {
-                if (ImGui::SliderFloat("Resize##CropResize", &params.cropResize.resize[0], 0.01f, 2.0f))
+                if (imGuiSliderFloatW("Resize##CropResize", &params.cropResize.resize[0], 0.01f, 2.0f))
                 {
                     params.cropResize.resize[0] = std::max(params.cropResize.resize[0], 0.01f);
                     params.cropResize.resize[1] = params.cropResize.resize[0];
@@ -1330,7 +1833,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
             if (lockScale[imGuiID])
             {
-                if (ImGui::SliderFloat("Scale##Transform", &params.transform.scale[0], 0.01f, 2.0f))
+                if (imGuiSliderFloatW("Scale##Transform", &params.transform.scale[0], 0.01f, 2.0f))
                 {
                     params.transform.scale[1] = params.transform.scale[0];
                     changed = true;
@@ -1345,7 +1848,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
 
             // Rotate
-            if (ImGui::SliderFloat("Rotate##Transform", &params.transform.rotate, -180.0f, 180.0f))
+            if (imGuiSliderFloatW("Rotate##Transform", &params.transform.rotate, -180.0f, 180.0f))
                 changed = true;
 
             // Translate
@@ -1386,11 +1889,11 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
 
             // Exposure
-            if (ImGui::SliderFloat("Exposure##Color", &params.color.exposure, -EXPOSURE_RANGE, EXPOSURE_RANGE))
+            if (imGuiSliderFloatW("Exposure##Color", &params.color.exposure, -EXPOSURE_RANGE, EXPOSURE_RANGE))
                 changed = true;
 
             // Contrast
-            if (ImGui::SliderFloat("Contrast##Color", &params.color.contrast, -1.0f, 1.0f))
+            if (imGuiSliderFloatW("Contrast##Color", &params.color.contrast, -1.0f, 1.0f))
                 changed = true;
 
             // Grayscale Type
@@ -1418,7 +1921,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
 
             // Grayscale Mix
-            if (ImGui::SliderFloat("Mix##Color", &params.color.grayscaleMix, -1.0f, 1.0f))
+            if (imGuiSliderFloatW("Mix##Color", &params.color.grayscaleMix, -1.0f, 1.0f))
                 changed = true;
 
             // Reset
@@ -1499,10 +2002,51 @@ void imGuiText(const std::string& s, bool isError, bool newLine)
     }
 }
 
+// Fine-adjust the last item with the mouse wheel, 1% of its range per notch.
+// SetItemKeyOwner claims the wheel while hovered so the surrounding panel
+// does not scroll at the same time.
+bool imGuiWheelAdjust(float* v, float vMin, float vMax)
+{
+    ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
+    if (!ImGui::IsItemHovered())
+        return false;
+
+    float wheel = ImGui::GetIO().MouseWheel;
+    if (wheel == 0.0f)
+        return false;
+
+    *v = std::clamp(*v + wheel * (vMax - vMin) * 0.01f, vMin, vMax);
+    return true;
+}
+
+// ImGui::SliderFloat + mouse wheel support
+bool imGuiSliderFloatW(const char* label, float* v, float vMin, float vMax)
+{
+    bool changed = ImGui::SliderFloat(label, v, vMin, vMax);
+    if (imGuiWheelAdjust(v, vMin, vMax))
+        changed = true;
+    return changed;
+}
+
 bool imGuiSliderUInt(const std::string& label, uint32_t* v, uint32_t min, uint32_t max)
 {
     int vInt = u32ToI32(*v);
-    if (ImGui::SliderInt(label.c_str(), &vInt, u32ToI32(min), u32ToI32(max)))
+    bool changed = ImGui::SliderInt(label.c_str(), &vInt, u32ToI32(min), u32ToI32(max));
+
+    // Mouse wheel: 1% of the range per notch, but never less than 1
+    ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
+    if (ImGui::IsItemHovered())
+    {
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.0f)
+        {
+            int step = std::max(1, (int)roundf((float)(max - min) * 0.01f));
+            vInt = std::clamp(vInt + (int)(wheel * (float)step), u32ToI32(min), u32ToI32(max));
+            changed = true;
+        }
+    }
+
+    if (changed)
     {
         *v = i32ToU32(vInt);
         return true;
@@ -1615,7 +2159,10 @@ void addImageSlot(const std::string& id, const std::string& name, bool canLoad, 
     slot.id = id;
     slot.name = name;
     slot.canLoad = canLoad;
-    slot.viewImage = std::make_shared<CmImage>(id, name);
+    // useGlobalFB = false: each visible slot needs its own framebuffer, otherwise
+    // every pane of the split view samples the same shared colour buffer.
+    slot.viewImage = std::make_shared<CmImage>(
+        id, name, 1, 1, std::array<float, 4>{ 0, 0, 0, 1 }, true, false);
     slot.internalImage = internalImage;
     slot.updateIndicator = updateIndicator;
 
@@ -1784,10 +2331,7 @@ bool setupImGui()
     }
 }
 
-static inline ImVec4 ImLerp(const ImVec4& a, const ImVec4& b, float t)
-{
-    return ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t);
-}
+// ImLerp() for ImVec4 now comes from imgui_internal.h
 
 static inline ImVec4 operator*(const ImVec4& lhs, const ImVec4& rhs)
 {
@@ -1939,9 +2483,36 @@ void dragDropCallback(GLFWwindow* window, int count, const char** paths)
     if (std::filesystem::is_directory(lastPath))
         return;
 
+    // Prefer the pane under the cursor so files can be dropped straight onto any
+    // slot in the split view, instead of only the currently selected one.
+    int target = -1;
+    {
+        double mx = 0.0, my = 0.0;
+        glfwGetCursorPos(window, &mx, &my);
+        for (size_t i = 0; i < viewerSlotRects.size(); i++)
+        {
+            const ImVec4& r = viewerSlotRects[i];
+            if ((r.z > r.x) && (r.w > r.y) &&
+                (mx >= r.x) && (mx < r.z) && (my >= r.y) && (my < r.w))
+            {
+                target = (int)i;
+                break;
+            }
+        }
+    }
+
+    if (target < 0)
+        target = selSlotIndex;
+
+    // Result slots cannot be loaded into; ignore the drop rather than
+    // silently sending the image somewhere the user did not point at.
+    if ((target < 0) || (target >= (int)slots.size()) || !slots[target].canLoad)
+        return;
+
     try
     {
-        loadImageToSlot(slots[selSlotIndex], lastPath);
+        loadImageToSlot(slots[target], lastPath);
+        selSlotIndex = target;
     }
     catch (const std::exception& e)
     {
