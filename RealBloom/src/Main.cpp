@@ -32,6 +32,7 @@ static const ImVec4 colorActionActive{ 0.10f, 0.32f, 0.44f, 1.0f };
 // Defined further down, used by the module panels above them
 static float moduleFooterHeight(bool withCancel);
 static bool imGuiActionButton(const char* label);
+static bool imGuiSection(const char* label, const char* key);
 static const ImVec4 colorWarningText{ 0.940f, 0.578f, 0.282f, 1.0f };
 static const ImVec4 colorErrorText{ 0.950f, 0.300f, 0.228f, 1.0f };
 
@@ -236,8 +237,6 @@ int main(int argc, char** argv)
     // GUI-specific
     if (!CLI::Interface::active())
     {
-        // Minimize the console window
-        PostMessage(GetConsoleWindow(), WM_SYSCOMMAND, SC_MINIMIZE, 0);
 
         // Native File Dialog Extended
         NFD_Init();
@@ -651,6 +650,15 @@ void layoutImagePanels()
         selSlotID = "";
     }
 
+    // Restore persisted view state once, after Config has been loaded
+    static bool viewStateLoaded = false;
+    if (!viewStateLoaded)
+    {
+        viewStateLoaded = true;
+        viewerWorkflow = (Workflow)std::clamp(Config::getUIState("viewer.workflow", 2), 0, 2);
+        viewerSplit = (Config::getUIState("viewer.split", 1) != 0);
+    }
+
     // Selected slot
     ImageSlot& selSlot = slots[selSlotIndex];
 
@@ -692,6 +700,7 @@ void layoutImagePanels()
                 if (ImGui::Selectable(workflowNames[i], (int)viewerWorkflow == i))
                 {
                     viewerWorkflow = (Workflow)i;
+                    Config::setUIState("viewer.workflow", i);
 
                     // Keep the selection inside the visible set
                     const std::vector<int> vis = visibleSlotIndices();
@@ -966,6 +975,16 @@ void layoutImagePanels()
             ImGui::EndChild();
 
             layoutSlotContextMenu(selSlotIndex);
+        }
+
+        // The view mode flips from several places; persist it in one spot.
+        {
+            static bool lastSplit = viewerSplit;
+            if (viewerSplit != lastSplit)
+            {
+                lastSplit = viewerSplit;
+                Config::setUIState("viewer.split", viewerSplit ? 1 : 0);
+            }
         }
 
         // Applied after every pane is drawn, so nothing mutates mid-iteration.
@@ -1590,8 +1609,9 @@ void layoutDispersion()
     // parameters settle. Cost grows linearly with steps x pixels, and compute()
     // cancels-and-joins any run in progress, so a heavy re-trigger would stall the
     // UI. Past a budget the auto-run backs off and the button takes over.
-    static bool dispLive = true;
-    ImGui::Checkbox("Live##Disp", &dispLive);
+    static bool dispLive = (Config::getUIState("disp.live", 1) != 0);
+    if (ImGui::Checkbox("Live##Disp", &dispLive))
+        Config::setUIState("disp.live", dispLive ? 1 : 0);
 
     const uint32_t dispInW = imgDispInput.getWidth();
     const uint32_t dispInH = imgDispInput.getHeight();
@@ -1722,7 +1742,7 @@ void layoutDiffraction()
         static int reqW = 0;
         static int reqH = 0;
         static bool editing = false;
-        static bool linkDims = true;
+        static bool linkDims = (Config::getUIState("diff.linkDims", 1) != 0);
         static bool hasRequest = false;   // an explicit target the user asked for
         static uint32_t lastSrcW = 0;
         static uint32_t lastSrcH = 0;
@@ -1757,7 +1777,8 @@ void layoutDiffraction()
         ImGui::PopItemWidth();
         editing = stillEditing;
 
-        ImGui::Checkbox("Link W/H##DiffOut", &linkDims);
+        if (ImGui::Checkbox("Link W/H##DiffOut", &linkDims))
+            Config::setUIState("diff.linkDims", linkDims ? 1 : 0);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Keep the source aspect ratio when changing either value.");
 
@@ -1878,8 +1899,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
     {
         ImGui::Indent();
 
-        imGuiBold("CROP & RESIZE");
-
+        if (imGuiSection("CROP & RESIZE", "sect.cropResize"))
         {
             ImGui::Indent();
 
@@ -1964,8 +1984,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
         }
 
         imGuiDiv();
-        imGuiBold("TRANSFORM");
-
+        if (imGuiSection("TRANSFORM", "sect.transform"))
         {
             ImGui::Indent();
 
@@ -2025,8 +2044,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
         }
 
         imGuiDiv();
-        imGuiBold("COLOR");
-
+        if (imGuiSection("COLOR", "sect.color"))
         {
             ImGui::Indent();
 
@@ -2083,8 +2101,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
         }
 
         imGuiDiv();
-        imGuiBold("GENERAL");
-
+        if (imGuiSection("GENERAL", "sect.general"))
         {
             ImGui::Indent();
 
@@ -2122,6 +2139,23 @@ void imGuiHorzDiv()
 {
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(1.0, 1.0, 1.0, 0.3), " | ");
+}
+
+// A collapsible section whose open/closed state survives a restart. ImGui keeps
+// tree node state in memory only, so it is round-tripped through Config.
+static bool imGuiSection(const char* label, const char* key)
+{
+    const bool wasOpen = (Config::getUIState(key, 1) != 0);
+    ImGui::SetNextItemOpen(wasOpen, ImGuiCond_Always);
+
+    ImGui::PushFont(fontRobotoBold);
+    const bool open = ImGui::CollapsingHeader(label);
+    ImGui::PopFont();
+
+    if (open != wasOpen)
+        Config::setUIState(key, open ? 1 : 0);
+
+    return open;
 }
 
 void imGuiBold(const std::string& s)
