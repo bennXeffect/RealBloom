@@ -6,7 +6,7 @@
 #include <memory>
 
 #include <OpenColorIO/OpenColorIO.h>
-namespace OCIO = OpenColorIO_v2_1;
+namespace OCIO = OCIO_NAMESPACE;
 
 #include "CMS.h"
 

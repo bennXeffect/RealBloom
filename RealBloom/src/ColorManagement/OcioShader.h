@@ -13,7 +13,7 @@
 #include "../Utils/Misc.h"
 
 #include <OpenColorIO/OpenColorIO.h>
-namespace OCIO = OpenColorIO_v2_1;
+namespace OCIO = OCIO_NAMESPACE;
 
 constexpr bool OCIO_SHADER_LOG = false;
 
