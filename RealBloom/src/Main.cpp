@@ -25,6 +25,13 @@ static const ImVec4 colorImageBorder{ 0.05f, 0.05f, 0.05f, 1.0f };
 static const ImVec4 colorInfoText{ 0.328f, 0.735f, 0.910f, 1.0f };
 static const ImVec4 colorPaneSelected{ 0.16f, 0.29f, 0.36f, 1.0f };
 static const ImVec4 colorPaneNormal{ 0.10f, 0.10f, 0.10f, 1.0f };
+static const ImVec4 colorAction{ 0.13f, 0.42f, 0.56f, 1.0f };
+static const ImVec4 colorActionHovered{ 0.20f, 0.56f, 0.72f, 1.0f };
+static const ImVec4 colorActionActive{ 0.10f, 0.32f, 0.44f, 1.0f };
+
+// Defined further down, used by the module panels above them
+static float moduleFooterHeight(bool withCancel);
+static bool imGuiActionButton(const char* label);
 static const ImVec4 colorWarningText{ 0.940f, 0.578f, 0.282f, 1.0f };
 static const ImVec4 colorErrorText{ 0.950f, 0.300f, 0.228f, 1.0f };
 
@@ -37,6 +44,30 @@ static int selSlotIndex = 0;
 static std::string selSlotID = ""; // will be updated externally, causing the index to update
 static float imageZoom = 1.0f;
 static ImVec2 imagePan{ 0.0f, 0.0f };   // single-view offset, in screen pixels
+static bool viewerRecenter = true;      // recentre the single view on next layout
+
+// Diffraction + dispersion produce a kernel; convolution consumes one. They are
+// rarely used at the same time, so the viewer shows one half or the other.
+enum class Workflow { Pattern = 0, Convolution = 1, Both = 2 };
+static Workflow viewerWorkflow = Workflow::Both;
+
+static std::vector<int> visibleSlotIndices()
+{
+    std::vector<int> vis;
+    for (int i = 0; i < (int)slots.size(); i++)
+    {
+        const std::string& id = slots[i].id;
+        const bool isPattern =
+            (id.rfind("diff-", 0) == 0) || (id.rfind("disp-", 0) == 0);
+        const bool isConv = (id.rfind("cv-", 0) == 0);
+
+        if ((viewerWorkflow == Workflow::Both)
+            || ((viewerWorkflow == Workflow::Pattern) && isPattern)
+            || ((viewerWorkflow == Workflow::Convolution) && isConv))
+            vis.push_back(i);
+    }
+    return vis;
+}
 static constexpr float IMAGE_ZOOM_MIN = 0.05f;
 static constexpr float IMAGE_ZOOM_MAX = 8.0f;
 
@@ -105,6 +136,32 @@ protected:
 
 };
 
+// The app is a console-subsystem binary so that "RealBloom.exe cli" works, which
+// means a console window comes along even in GUI mode. Hide it, but ONLY when it
+// belongs to us alone: if we were launched from an existing terminal we inherited
+// that console, and hiding it would hide the user's own window.
+// Opt back into the console without rebuilding, for diagnosing a problem.
+static bool wantsConsole(int argc, char** argv)
+{
+    for (int i = 1; i < argc; i++)
+        if (std::string(argv[i]) == "--console")
+            return true;
+    return false;
+}
+
+static void hideOwnConsoleWindow()
+{
+    if (GetConsoleWindow() == NULL)
+        return;
+
+    // Detach rather than hiding the window. Under ConPTY, GetConsoleWindow()
+    // returns a proxy that is not what the user actually sees, so hiding it does
+    // nothing; the real window belongs to a separate console host process.
+    // Detaching is also the safer option when we inherited a terminal: we simply
+    // stop using it, instead of hiding a window that belongs to the user.
+    FreeConsole();
+}
+
 int main(int argc, char** argv)
 {
     // Set Locale
@@ -122,6 +179,7 @@ int main(int argc, char** argv)
     // GUI-specific
     if (!CLI::Interface::active())
     {
+
         // Change the working directory so ImGui can load its
         // config properly
         SetCurrentDirectoryA(getExecDir().c_str());
@@ -148,6 +206,18 @@ int main(int argc, char** argv)
             std::cout << "Failed to initialize ImGui.\n";
             return 1;
         }
+
+        // Drop the console so normal use is a plain windowed app. Only once
+        // startup has succeeded: releasing it earlier would mean a GLFW/GLEW/ImGui
+        // failure above prints into the void and the app dies with no window and
+        // no message at all.
+        //
+        // Debug builds always keep it, and --console keeps it in Release, so
+        // diagnosing something never needs a rebuild.
+#ifndef _DEBUG
+        if (!wantsConsole(argc, argv))
+            hideOwnConsoleWindow();
+#endif
     }
 
     // Color Management System
@@ -324,14 +394,31 @@ int main(int argc, char** argv)
     return 0;
 }
 
+// One module panel whose contents follow the selected slot. These used to be three
+// docked windows, which meant three tabs to choose between even though the choice
+// is already implied by the image you are looking at.
+static void layoutModulePanel()
+{
+    ImGui::Begin("Module");
+
+    const std::string& id = slots[selSlotIndex].id;
+    if (id.rfind("diff-", 0) == 0)
+        layoutDiffraction();
+    else if (id.rfind("disp-", 0) == 0)
+        layoutDispersion();
+    else
+        layoutConvolution();
+
+    imGuiDialogs();
+    ImGui::End();
+}
+
 void layoutAll()
 {
     layoutImagePanels();
     layoutColorManagement();
     layoutMisc();
-    layoutConvolution();
-    layoutDispersion();
-    layoutDiffraction();
+    layoutModulePanel();
     layoutDebug();
 }
 
@@ -391,6 +478,24 @@ static void layoutSlotContextMenu(int slotIndex)
     {
         try { saveImageFromSlot(slot); }
         catch (const std::exception& e) { printError(__FUNCTION__, "", e.what()); }
+    }
+
+    // Replaces the old Move To dialog, and unlike dragging it works even when
+    // the destination is not on screen, e.g. handing a kernel to the other workflow.
+    if (hasImage && ImGui::BeginMenu("Send to"))
+    {
+        for (int i = 0; i < (int)slots.size(); i++)
+        {
+            if ((i == slotIndex) || !slots[i].canLoad)
+                continue;
+
+            if (ImGui::MenuItem(slots[i].name.c_str()))
+            {
+                pendingMoveSrc = slotIndex;
+                pendingMoveDst = i;
+            }
+        }
+        ImGui::EndMenu();
     }
 
     ImGui::Separator();
@@ -476,6 +581,14 @@ static bool layoutSlotPane(int slotIndex, const ImVec2& cellSize)
             selSlotIndex = slotIndex;
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
             doubleClicked = true;
+
+        // Scrolling a pane fills the viewer with it, so the wheel reads as
+        // "look closer". Double-click stays the only way back out.
+        if (ImGui::GetIO().MouseWheel != 0.0f)
+        {
+            selSlotIndex = slotIndex;
+            doubleClicked = true;
+        }
     }
 
     // Drop target spans the whole pane, not just the image, so an empty slot can
@@ -547,7 +660,7 @@ void layoutImagePanels()
     {
         selSlot.viewImage->moveToGPU();
         lastSelSlotIndex = selSlotIndex;
-        imagePan = ImVec2(0.0f, 0.0f);
+        viewerRecenter = true;
 
         // Bring the module panel that owns this slot to the front, so the
         // visible tab always matches the slot being worked on.
@@ -563,78 +676,36 @@ void layoutImagePanels()
     {
         ImGui::Begin("Image Slots");
 
-        imGuiBold("SLOTS");
+        imGuiBold("WORKFLOW");
 
-        // Slots
-        ImGui::PushItemWidth(-1);
-        ImGui::ListBox(
-            "##ImageSlots_List",
-            &selSlotIndex,
-            [](void* data, int index, const char** outText)
-            {
-                *outText = slotNames[index].c_str();
-                return true;
-            },
-            nullptr, slots.size(), slots.size());
-        ImGui::PopItemWidth();
+        // Selecting a half limits the viewer to its four slots. "Both" keeps the
+        // full grid, which is what you want when handing a kernel across.
+        {
+            static const char* const workflowNames[]{
+                "Pattern  (Diffraction + Dispersion)",
+                "Convolution",
+                "Both"
+            };
 
-        // Compare input and result slots
-        if ((selSlot.id == "disp-input") || (selSlot.id == "disp-result"))
-        {
-            if (ImGui::Button("Compare##ImageSlots_0", btnSize()))
+            for (int i = 0; i < 3; i++)
             {
-                if (selSlot.id == "disp-input") selSlotID = "disp-result";
-                else selSlotID = "disp-input";
-            }
-        }
-        else if ((selSlot.id == "cv-input") || (selSlot.id == "cv-result"))
-        {
-            if (ImGui::Button("Compare##ImageSlots_1", btnSize()))
-            {
-                if (selSlot.id == "cv-input") selSlotID = "cv-result";
-                else selSlotID = "cv-input";
-            }
-        }
-        else if ((selSlot.id == "diff-input") || (selSlot.id == "diff-result"))
-        {
-            if (ImGui::Button("Compare##ImageSlots_2", btnSize()))
-            {
-                if (selSlot.id == "diff-input") selSlotID = "diff-result";
-                else selSlotID = "diff-input";
-            }
-        }
-        else
-        {
-            ImGui::BeginDisabled();
-            ImGui::Button("Compare##ImageSlots", btnSize());
-            ImGui::EndDisabled();
-        }
-
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("A/B flip between this module's input and result. Only available on input/result slots.");
-
-        // Move To
-        if (ImGui::Button("Move To##ImageSlots", btnSize()))
-        {
-            dialogParams_MoveTo.selSourceSlot = selSlotIndex;
-            dialogParams_MoveTo.selDestSlot = -1;
-
-            // Try to auto-select the destination slot
-            for (uint32_t i = 0; i < loadableSlotIndices.size(); i++)
-            {
-                if (loadableSlotIndices[i] > selSlotIndex
-                    && (loadableSlotIndices[i] - selSlotIndex) < 3)
+                if (ImGui::Selectable(workflowNames[i], (int)viewerWorkflow == i))
                 {
-                    dialogParams_MoveTo.selDestSlot = i;
-                    break;
+                    viewerWorkflow = (Workflow)i;
+
+                    // Keep the selection inside the visible set
+                    const std::vector<int> vis = visibleSlotIndices();
+                    if (!vis.empty()
+                        && (std::find(vis.begin(), vis.end(), selSlotIndex) == vis.end()))
+                        selSlotIndex = vis[0];
                 }
             }
-
-            ImGui::OpenPopup(DIALOG_TITLE_MOVETO);
         }
 
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Copy this image into another slot. Easier: drag one pane onto another in the viewer. This is how modules chain, e.g. Diffraction Result -> Conv. Kernel.");
+        ImGui::NewLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+        ImGui::TextWrapped("Click a pane to select it. Drag one onto another to copy it, or right-click for Send to. Scroll or double-click a pane to fill the viewer.");
+        ImGui::PopStyleColor();
 
         ImGui::NewLine();
         imGuiDialogs();
@@ -680,7 +751,7 @@ void layoutImagePanels()
             if (ImGui::SmallButton("R##ImageViewer"))
             {
                 imageZoom = 1.0f;
-                imagePan = ImVec2(0.0f, 0.0f);
+                viewerRecenter = true;
             }
         }
 
@@ -745,7 +816,7 @@ void layoutImagePanels()
         if (ImGui::SmallButton(viewerSplit ? "Single##ImageViewer" : "Split##ImageViewer"))
         {
             viewerSplit = !viewerSplit;
-            imagePan = ImVec2(0.0f, 0.0f);
+            viewerRecenter = true;
         }
 
         ImGui::PopFont();
@@ -768,8 +839,10 @@ void layoutImagePanels()
             const ImVec2 spacing = ImGui::GetStyle().ItemSpacing;
             const float minCellW = 190.0f * Config::UI_SCALE;
 
-            const int count = (int)slots.size();
-            const int cols = std::clamp((int)(avail.x / minCellW), 1, 4);
+            const std::vector<int> vis = visibleSlotIndices();
+            const int count = (int)vis.size();
+            const int maxCols = (count <= 4) ? 2 : 4;
+            const int cols = std::clamp((int)(avail.x / minCellW), 1, maxCols);
             const int rows = (count + cols - 1) / cols;
 
             const ImVec2 cell(
@@ -782,11 +855,11 @@ void layoutImagePanels()
                 if ((i % cols) != 0)
                     ImGui::SameLine();
 
-                // Double-clicking a pane blows it up to fill the viewer
-                if (layoutSlotPane(i, cell))
+                // Double-click or scroll blows a pane up to fill the viewer
+                if (layoutSlotPane(vis[i], cell))
                 {
                     viewerSplit = false;
-                    imagePan = ImVec2(0.0f, 0.0f);
+                    viewerRecenter = true;
                 }
             }
         }
@@ -851,7 +924,7 @@ void layoutImagePanels()
                     if ((fabsf(d.x) + fabsf(d.y)) < 4.0f)
                     {
                         imageZoom = 1.0f;
-                        imagePan = ImVec2(0.0f, 0.0f);
+                        viewerRecenter = true;
                     }
                 }
 
@@ -862,6 +935,15 @@ void layoutImagePanels()
 
             const ImVec2 drawSize(
                 (float)imageWidth * imageZoom, (float)imageHeight * imageZoom);
+
+            // Centre on entry. The interesting part of a diffraction pattern is
+            // its core, so landing on the top-left corner is never what you want.
+            if (viewerRecenter)
+            {
+                viewerRecenter = false;
+                imagePan.x = (canvas.x - drawSize.x) * 0.5f;
+                imagePan.y = (canvas.y - drawSize.y) * 0.5f;
+            }
 
             // Keep a sliver of the image on screen so it cannot be lost entirely
             {
@@ -914,7 +996,7 @@ void layoutColorManagement()
 
         // Exposure
         float cmsExposure = CMS::getExposure();
-        if (imGuiSliderFloatW("Exposure##CMS", &cmsExposure, -EXPOSURE_RANGE, EXPOSURE_RANGE))
+        if (imGuiSliderFloatW("Exposure##CMS", &cmsExposure, -EXPOSURE_RANGE, EXPOSURE_RANGE, 0.0f))
         {
             CMS::setExposure(cmsExposure);
             cmsParamsChanged = true;
@@ -1211,7 +1293,7 @@ void layoutMisc()
     ImGui::PopStyleColor();
 
 
-    if (imGuiSliderFloatW("Scale##Misc", &Config::UI_SCALE, Config::UI_MIN_SCALE, Config::UI_MAX_SCALE))
+    if (imGuiSliderFloatW("Scale##Misc", &Config::UI_SCALE, Config::UI_MIN_SCALE, Config::UI_MAX_SCALE, 1.0f))
     {
         Config::UI_SCALE = fminf(fmaxf(Config::UI_SCALE, Config::UI_MIN_SCALE), Config::UI_MAX_SCALE);
         io->FontGlobalScale = Config::UI_SCALE / Config::UI_MAX_SCALE;
@@ -1254,13 +1336,18 @@ void layoutConvolution()
     CmImage& imgConvResult = *getSlotByID("cv-result").viewImage;
     RealBloom::ConvolutionParams* convParams = conv.getParams();
 
-    ImGui::Begin("Convolution");
 
-    imGuiBold("INPUT");
+    const std::string& curSlotId = slots[selSlotIndex].id;
 
-    if (layoutImageTransformParams("Input", "ConvInput", convParams->inputTransformParams))
+    // Everything above the action scrolls; the action itself stays pinned.
+    ImGui::BeginChild("##ConvScroll",
+        ImVec2(0.0f, -moduleFooterHeight(conv.getStatus().isWorking())));
+
+    if (curSlotId == "cv-input")
     {
-        convInputUpdated = true;
+        imGuiBold("INPUT");
+        if (layoutImageTransformParams("Input", "ConvInput", convParams->inputTransformParams))
+            convInputUpdated = true;
     }
 
     if (convInputUpdated)
@@ -1271,12 +1358,12 @@ void layoutConvolution()
         selSlotID = "cv-input";
     }
 
-    imGuiDiv();
-    imGuiBold("KERNEL");
-
-    if (layoutImageTransformParams("Kernel", "ConvKernel", convParams->kernelTransformParams))
+    if (curSlotId == "cv-kernel")
     {
-        convKernelUpdated = true;
+        imGuiDiv();
+        imGuiBold("KERNEL");
+        if (layoutImageTransformParams("Kernel", "ConvKernel", convParams->kernelTransformParams))
+            convKernelUpdated = true;
     }
 
     if (convKernelUpdated)
@@ -1286,7 +1373,8 @@ void layoutConvolution()
         selSlotID = "cv-kernel";
     }
 
-    ImGui::Checkbox("Use Transform Origin##Conv", &convParams->useKernelTransformOrigin);
+    if (curSlotId == "cv-kernel")
+        ImGui::Checkbox("Use Transform Origin##Conv", &convParams->useKernelTransformOrigin);
 
     imGuiDiv();
     imGuiBold("CONVOLUTION");
@@ -1317,13 +1405,13 @@ void layoutConvolution()
             convParams->methodInfo.NAIVE_GPU_chunkSleep = std::clamp(convParams->methodInfo.NAIVE_GPU_chunkSleep, 0u, RealBloom::CONV_NAIVE_GPU_MAX_SLEEP);
     }
 
-    if (imGuiSliderFloatW("Threshold##Conv", &convParams->threshold, 0.0f, 2.0f))
+    if (imGuiSliderFloatW("Threshold##Conv", &convParams->threshold, 0.0f, 2.0f, 0.0f))
     {
         convParams->threshold = std::max(convParams->threshold, 0.0f);
         convThresholdUpdated = true;
     }
 
-    if (imGuiSliderFloatW("Knee##Conv", &convParams->knee, 0.0f, 2.0f))
+    if (imGuiSliderFloatW("Knee##Conv", &convParams->knee, 0.0f, 2.0f, 0.0f))
     {
         convParams->knee = std::max(convParams->knee, 0.0f);
         convThresholdUpdated = true;
@@ -1341,23 +1429,6 @@ void layoutConvolution()
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Adjust the exposure to preserve the overall brightness");
 
-    if (ImGui::Button("Convolve##Conv", btnSize()))
-    {
-        imgConvResult.resize(imgConvInput.getWidth(), imgConvInput.getHeight(), true);
-        imgConvResult.fill(std::array<float, 4>{ 0, 0, 0, 1 }, true);
-        imgConvResult.moveToGPU();
-        selSlotID = "cv-result";
-
-        conv.convolve();
-    }
-    if (ImGui::IsItemHovered() && !convResUsage.empty())
-        ImGui::SetTooltip(convResUsage.c_str());
-
-    if (conv.getStatus().isWorking())
-    {
-        if (ImGui::Button("Cancel##Conv", btnSize()))
-            conv.cancel();
-    }
 
     std::string convStatus, convMessage;
     uint32_t convMessageType = 1;
@@ -1396,13 +1467,13 @@ void layoutConvolution()
 
     if (convParams->blendAdditive)
     {
-        if (imGuiSliderFloatW("Input##Conv", &convParams->blendInput, 0.0f, 1.0f))
+        if (imGuiSliderFloatW("Input##Conv", &convParams->blendInput, 0.0f, 1.0f, 1.0f))
         {
             convParams->blendInput = std::max(convParams->blendInput, 0.0f);
             convBlendParamsUpdated = true;
         }
 
-        if (imGuiSliderFloatW("Conv.##Conv", &convParams->blendConv, 0.0f, 1.0f))
+        if (imGuiSliderFloatW("Conv.##Conv", &convParams->blendConv, 0.0f, 1.0f, 0.2f))
         {
             convParams->blendConv = std::max(convParams->blendConv, 0.0f);
             convBlendParamsUpdated = true;
@@ -1410,14 +1481,14 @@ void layoutConvolution()
     }
     else
     {
-        if (imGuiSliderFloatW("Mix##Conv", &convParams->blendMix, 0.0f, 1.0f))
+        if (imGuiSliderFloatW("Mix##Conv", &convParams->blendMix, 0.0f, 1.0f, 0.2f))
         {
             convParams->blendMix = std::clamp(convParams->blendMix, 0.0f, 1.0f);
             convBlendParamsUpdated = true;
         }
     }
 
-    if (imGuiSliderFloatW("Exposure##Conv", &convParams->blendExposure, -EXPOSURE_RANGE, EXPOSURE_RANGE))
+    if (imGuiSliderFloatW("Exposure##Conv", &convParams->blendExposure, -EXPOSURE_RANGE, EXPOSURE_RANGE, 0.0f))
         convBlendParamsUpdated = true;
 
     if (ImGui::Button("Show Conv. Layer##Conv", btnSize()))
@@ -1441,9 +1512,25 @@ void layoutConvolution()
         selSlotID = "cv-result";
     }
 
-    ImGui::NewLine();
-    imGuiDialogs();
-    ImGui::End();
+    ImGui::EndChild();
+
+    if (imGuiActionButton("Convolve##Conv"))
+    {
+        imgConvResult.resize(imgConvInput.getWidth(), imgConvInput.getHeight(), true);
+        imgConvResult.fill(std::array<float, 4>{ 0, 0, 0, 1 }, true);
+        imgConvResult.moveToGPU();
+        selSlotID = "cv-result";
+
+        conv.convolve();
+    }
+    if (ImGui::IsItemHovered() && !convResUsage.empty())
+        ImGui::SetTooltip(convResUsage.c_str());
+
+    if (conv.getStatus().isWorking())
+    {
+        if (ImGui::Button("Cancel##Conv", btnSize()))
+            conv.cancel();
+    }
 }
 
 void layoutDispersion()
@@ -1453,12 +1540,19 @@ void layoutDispersion()
     CmImage& imgDispInput = *getSlotByID("disp-input").viewImage;
     CmImage& imgDispResult = *getSlotByID("disp-result").viewImage;
 
-    ImGui::Begin("Dispersion");
 
-    imGuiBold("INPUT");
+    const std::string& curSlotId = slots[selSlotIndex].id;
 
-    if (layoutImageTransformParams("Input", "DispInput", dispParams->inputTransformParams))
-        dispInputUpdated = true;
+    // Everything above the action scrolls; the action itself stays pinned.
+    ImGui::BeginChild("##DispScroll",
+        ImVec2(0.0f, -moduleFooterHeight(disp.getStatus().isWorking())));
+
+    if (curSlotId == "disp-input")
+    {
+        imGuiBold("INPUT");
+        if (layoutImageTransformParams("Input", "DispInput", dispParams->inputTransformParams))
+            dispInputUpdated = true;
+    }
 
     bool dispInputChanged = false;
     if (dispInputUpdated)
@@ -1472,13 +1566,13 @@ void layoutDispersion()
     imGuiDiv();
     imGuiBold("DISPERSION");
 
-    if (imGuiSliderFloatW("Amount##Disp", &dispParams->amount, 0.0f, 1.0f))
+    if (imGuiSliderFloatW("Amount##Disp", &dispParams->amount, 0.0f, 1.0f, 0.4f))
         dispParams->amount = fmaxf(dispParams->amount, 0.0f);
 
-    if (imGuiSliderFloatW("Edge Offset##Disp", &dispParams->edgeOffset, -1.0f, 1.0f))
+    if (imGuiSliderFloatW("Edge Offset##Disp", &dispParams->edgeOffset, -1.0f, 1.0f, 0.0f))
         dispParams->edgeOffset = std::clamp(dispParams->edgeOffset, -1.0f, 1.0f);
 
-    if (imGuiSliderUInt("Steps##Disp", &dispParams->steps, 32, 1024))
+    if (imGuiSliderUInt("Steps##Disp", &dispParams->steps, 32, 1024, 32))
         dispParams->steps = std::clamp(dispParams->steps, 1u, RealBloom::DISP_MAX_STEPS);
 
     const char* const dispMethodItems[]{ "CPU", "GPU" };
@@ -1560,37 +1654,41 @@ void layoutDispersion()
         }
     }
 
-    if (ImGui::Button("Apply Dispersion##Disp", btnSize()))
-        applyDispersion(true);
-
     if (dispLive && dispHasInput && dispTooHeavy)
         imGuiText("Live paused: too heavy at these settings. Use Apply.", false, false);
+
+    std::string dispStats = disp.getStatusText();
+    imGuiText(dispStats, !disp.getStatus().isOK(), false);
+
+    ImGui::EndChild();
+
+    if (imGuiActionButton("Apply Dispersion##Disp"))
+        applyDispersion(true);
 
     if (disp.getStatus().isWorking())
     {
         if (ImGui::Button("Cancel##Disp", btnSize()))
             disp.cancel();
     }
-
-    std::string dispStats = disp.getStatusText();
-    imGuiText(dispStats, !disp.getStatus().isOK(), false);
-
-    ImGui::NewLine();
-    imGuiDialogs();
-    ImGui::End();
 }
 
 void layoutDiffraction()
 {
     RealBloom::DiffractionParams* diffParams = diff.getParams();
 
-    ImGui::Begin("Diffraction");
 
-    imGuiBold("INPUT");
+    // The right-hand panel follows the selected slot: showing a transform that
+    // belongs to a different image is just confusing.
+    const std::string& curSlotId = slots[selSlotIndex].id;
 
-    if (layoutImageTransformParams("Input", "DiffInput", diffParams->inputTransformParams))
+    // Everything above the action scrolls; the action itself stays pinned.
+    ImGui::BeginChild("##DiffScroll", ImVec2(0.0f, -moduleFooterHeight(false)));
+
+    if (curSlotId == "diff-input")
     {
-        diffInputUpdated = true;
+        imGuiBold("INPUT");
+        if (layoutImageTransformParams("Input", "DiffInput", diffParams->inputTransformParams))
+            diffInputUpdated = true;
     }
 
     if (diffInputUpdated)
@@ -1731,21 +1829,19 @@ void layoutDiffraction()
     ImGui::TextWrapped("Scaling the aperture down widens the result, and vice versa (Fourier scaling).");
     ImGui::PopStyleColor();
 
-    if (ImGui::Button("Compute##Diff", btnSize()))
-    {
-        selSlotID = "diff-result";
-        diff.compute();
-    }
-
     if (!diff.getStatus().isOK())
     {
         std::string dpError = diff.getStatus().getError();
         imGuiText(dpError, true, false);
     }
 
-    ImGui::NewLine();
-    imGuiDialogs();
-    ImGui::End();
+    ImGui::EndChild();
+
+    if (imGuiActionButton("Compute##Diff"))
+    {
+        selSlotID = "diff-result";
+        diff.compute();
+    }
 }
 
 void layoutDebug()
@@ -1776,8 +1872,9 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
     if (!lockScale.contains(imGuiID))
         lockScale[imGuiID] = true;
 
+    // Not collapsible: only the transform belonging to the selected slot is shown,
+    // so there is never more than one and nothing to fold away.
     ImGui::PushID(imGuiID.c_str());
-    if (ImGui::CollapsingHeader(strFormat("%s Transform", imageName.c_str()).c_str()))
     {
         ImGui::Indent();
 
@@ -1798,7 +1895,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
             if (lockCrop[imGuiID])
             {
-                if (imGuiSliderFloatW("Crop##CropResize", &params.cropResize.crop[0], 0.01f, 1.0f))
+                if (imGuiSliderFloatW("Crop##CropResize", &params.cropResize.crop[0], 0.01f, 1.0f, 1.0f))
                 {
                     params.cropResize.crop[0] = std::clamp(params.cropResize.crop[0], 0.01f, 1.0f);
                     params.cropResize.crop[1] = params.cropResize.crop[0];
@@ -1827,7 +1924,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
             if (lockResize[imGuiID])
             {
-                if (imGuiSliderFloatW("Resize##CropResize", &params.cropResize.resize[0], 0.01f, 2.0f))
+                if (imGuiSliderFloatW("Resize##CropResize", &params.cropResize.resize[0], 0.01f, 2.0f, 1.0f))
                 {
                     params.cropResize.resize[0] = std::max(params.cropResize.resize[0], 0.01f);
                     params.cropResize.resize[1] = params.cropResize.resize[0];
@@ -1884,7 +1981,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
             if (lockScale[imGuiID])
             {
-                if (imGuiSliderFloatW("Scale##Transform", &params.transform.scale[0], 0.01f, 2.0f))
+                if (imGuiSliderFloatW("Scale##Transform", &params.transform.scale[0], 0.01f, 2.0f, 1.0f))
                 {
                     params.transform.scale[1] = params.transform.scale[0];
                     changed = true;
@@ -1899,7 +1996,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
 
             // Rotate
-            if (imGuiSliderFloatW("Rotate##Transform", &params.transform.rotate, -180.0f, 180.0f))
+            if (imGuiSliderFloatW("Rotate##Transform", &params.transform.rotate, -180.0f, 180.0f, 0.0f))
                 changed = true;
 
             // Translate
@@ -1940,11 +2037,11 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
 
             // Exposure
-            if (imGuiSliderFloatW("Exposure##Color", &params.color.exposure, -EXPOSURE_RANGE, EXPOSURE_RANGE))
+            if (imGuiSliderFloatW("Exposure##Color", &params.color.exposure, -EXPOSURE_RANGE, EXPOSURE_RANGE, 0.0f))
                 changed = true;
 
             // Contrast
-            if (imGuiSliderFloatW("Contrast##Color", &params.color.contrast, -1.0f, 1.0f))
+            if (imGuiSliderFloatW("Contrast##Color", &params.color.contrast, -1.0f, 1.0f, 0.0f))
                 changed = true;
 
             // Grayscale Type
@@ -1972,7 +2069,7 @@ bool layoutImageTransformParams(const std::string& imageName, const std::string&
             }
 
             // Grayscale Mix
-            if (imGuiSliderFloatW("Mix##Color", &params.color.grayscaleMix, -1.0f, 1.0f))
+            if (imGuiSliderFloatW("Mix##Color", &params.color.grayscaleMix, -1.0f, 1.0f, 1.0f))
                 changed = true;
 
             // Reset
@@ -2082,16 +2179,32 @@ bool imGuiWheelAdjust(float* v, float vMin, float vMax)
     return true;
 }
 
-// ImGui::SliderFloat + mouse wheel support
-bool imGuiSliderFloatW(const char* label, float* v, float vMin, float vMax)
+// Backspace over a slider restores its default, the way Blender does.
+// Safe to key off hover: unlike the wheel, Backspace is a deliberate press
+// and collides with nothing.
+static bool imGuiDefaultReset(float* v, float vDefault)
+{
+    if (vDefault == FLT_MAX)
+        return false;
+    if (!ImGui::IsItemHovered() || !ImGui::IsKeyPressed(ImGuiKey_Backspace))
+        return false;
+
+    *v = vDefault;
+    return true;
+}
+
+// ImGui::SliderFloat + mouse wheel and default-reset support
+bool imGuiSliderFloatW(const char* label, float* v, float vMin, float vMax, float vDefault)
 {
     bool changed = ImGui::SliderFloat(label, v, vMin, vMax);
     if (imGuiWheelAdjust(v, vMin, vMax))
         changed = true;
+    if (imGuiDefaultReset(v, vDefault))
+        changed = true;
     return changed;
 }
 
-bool imGuiSliderUInt(const std::string& label, uint32_t* v, uint32_t min, uint32_t max)
+bool imGuiSliderUInt(const std::string& label, uint32_t* v, uint32_t min, uint32_t max, uint32_t vDefault)
 {
     int vInt = u32ToI32(*v);
     bool changed = ImGui::SliderInt(label.c_str(), &vInt, u32ToI32(min), u32ToI32(max));
@@ -2107,6 +2220,14 @@ bool imGuiSliderUInt(const std::string& label, uint32_t* v, uint32_t min, uint32
             vInt = std::clamp(vInt + (int)(wheel * (float)step), u32ToI32(min), u32ToI32(max));
             changed = true;
         }
+    }
+
+    // Backspace over the slider restores its default
+    if ((vDefault != UINT32_MAX) && ImGui::IsItemHovered()
+        && ImGui::IsKeyPressed(ImGuiKey_Backspace))
+    {
+        vInt = u32ToI32(vDefault);
+        changed = true;
     }
 
     if (changed)
@@ -2287,6 +2408,27 @@ bool saveImageFromSlot(ImageSlot& slot)
 ImVec2 btnSize()
 {
     return { -1.0f, 28.0f * Config::UI_SCALE };
+}
+
+// Height to reserve at the bottom of a module panel for its pinned action.
+static float moduleFooterHeight(bool withCancel)
+{
+    const float btnH = 28.0f * Config::UI_SCALE;
+    const float sp = ImGui::GetStyle().ItemSpacing.y;
+    return (withCancel ? (btnH * 2.0f + sp) : btnH) + sp * 2.0f;
+}
+
+// A module's primary action, tinted so it stands out from ordinary controls.
+static bool imGuiActionButton(const char* label)
+{
+    ImGui::PushStyleColor(ImGuiCol_Button, colorAction);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, colorActionHovered);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, colorActionActive);
+    ImGui::PushFont(fontRobotoBold);
+    const bool clicked = ImGui::Button(label, btnSize());
+    ImGui::PopFont();
+    ImGui::PopStyleColor(3);
+    return clicked;
 }
 
 ImVec2 dlgBtnSize()
