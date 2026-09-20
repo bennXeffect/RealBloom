@@ -35,6 +35,7 @@
 <details>
   <summary>Table of Contents</summary>
   <ol>
+    <li><a href="#fork-changes">Fork Changes</a></li>
     <li><a href="#introduction">Introduction</a></li>
     <li><a href="#how-its-made">How It's Made</a></li>
     <li><a href="#how-to-run">How To Run</a></li>
@@ -45,6 +46,106 @@
     <li><a href="#contact">Contact</a></li>
   </ol>
 </details>
+
+
+
+<!-- FORK CHANGES -->
+# Fork Changes
+
+This is a fork of [bean-mhm/realbloom](https://github.com/bean-mhm/realbloom) with two
+independent sets of changes: making v0.8.0 build against current dependencies, and a
+rework of the image viewer. Everything else is upstream's work.
+
+## Building against current OpenColorIO / OpenImageIO
+
+v0.8.0 targets OCIO 2.1 and OIIO 2.4. Current vcpkg ships OCIO 2.5 and OIIO 3.1, which
+breaks the build in three places:
+
+| Problem | Fix |
+|--|--|
+| Five files hardcoded `namespace OCIO = OpenColorIO_v2_1` | Use the version-agnostic `OCIO_NAMESPACE` macro, so future OCIO bumps do not break it again |
+| OCIO 2.5 added a `TextureDimensions` out-param to `GpuShaderDesc::getTexture()` | Pass it through; the existing height-based `GL_TEXTURE_1D`/`2D` choice still holds, so behaviour is unchanged |
+| OIIO 3.x moved `TypeDesc::TypeString` to namespace-level `OIIO::TypeString`, and its bundled fmt requires `/utf-8` | Updated the call site and added the compiler flag |
+
+These are compatibility shims, not behaviour changes. Verified by rendering a hexagon
+aperture diffraction pattern through the CLI and comparing against the official v0.8.0
+release binary: **0 of 1,050,625 pixels differ**.
+
+They are isolated in a single commit on the [`ocio-oiio-compat`](../../tree/ocio-oiio-compat)
+branch, which applies cleanly to upstream `main` on its own.
+
+## Image viewer
+
+![Split image viewer](images/fork/split-viewer.png)
+
+The viewer showed one image slot at a time, which turned out to be the root of several
+separate annoyances: *Compare* existed only to flip around it, drag-and-drop had to
+target "the selected slot", and the module tabs drifted out of sync with the slot being
+worked on. Above, an aperture and its diffraction pattern are visible side by side, with
+no slot switching.
+
+- **Split view** of all 8 slots in an adaptive grid. Double-click a pane to maximise it,
+  double-click again to go back.
+- **Drag one pane onto another** to copy its image, Shift to move. This is how modules
+  chain (Diffraction Result into Conv. Kernel), previously only possible via a dialog.
+- **Right-click a pane** for Browse / Save / Clear.
+- **Cursor-anchored zoom** in single view, with drag to pan. Files dropped from the OS
+  land in the pane under the cursor.
+
+Note that each slot now owns its framebuffer. `CmImage` defaults to a single shared
+static framebuffer, which is fine when only one image is ever on screen but makes every
+pane of a grid display whatever rendered last. The cost is one framebuffer per populated
+slot, roughly 16 MB at 1024x1024.
+
+## Interaction
+
+- **Mouse wheel over a slider** adjusts it by 1% of its range. Requires holding the
+  slider or holding Ctrl, so scrolling a panel never silently edits a value it passes over.
+- **Selecting a slot brings its module tab forward**, so the panel always matches the
+  image being worked on.
+- **Live dispersion preview**, with a cost guard that backs off once steps x pixels gets
+  expensive. Diffraction is deliberately left manual: its `compute()` is synchronous on
+  the UI thread, so a live version would freeze the window.
+- Tooltips for *Compare* and *Move To*, and a note that aperture size and pattern size
+  are reciprocal, which is the most common source of confusion for new users.
+
+## Explicit kernel resolution
+
+<img src="images/fork/output-size.png" width="300" align="right">
+
+Output size was only reachable through a *Resize* multiplier on the input transform.
+Since a kernel's pixel dimensions are what set the glare's reach in a compositor, the
+Diffraction panel now takes an explicit width and height, with an optional aspect link,
+and reports the resulting kernel size including the FFT's odd-size padding.
+
+The underlying multiplier is re-derived whenever the source image changes, so an
+explicit target survives loading a different aperture.
+
+Sliders elsewhere accept exact values too: **Ctrl+Click any slider to type into it**.
+That is stock Dear ImGui behaviour that was simply never documented.
+
+<br clear="right">
+
+## Example output
+
+A dispersed diffraction kernel generated from `demo/Apertures/Octagon.png`, ready to drop
+into a compositor as a glare or convolution kernel:
+
+![Example kernel](images/fork/kernel-example.png)
+
+Generated headlessly in about two seconds at 512 dispersion steps:
+
+```sh
+RealBloom.exe cli
+> diff -i "demo/Apertures/Octagon.png" -a sRGB -o d.exr -p "Linear BT.709 I-D65"
+> disp -i d.exr -a "Linear BT.709 I-D65" -o kernel.exr -p "Linear BT.709 I-D65" -d 0.4 -e 0 -s 512
+```
+
+When exporting kernels for a compositor, set **Output** in Color Management > IMAGE IO to
+match the target's scene-linear space and leave **Apply View Transform** off, otherwise a
+display transform gets baked into what should be linear data.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 
 
