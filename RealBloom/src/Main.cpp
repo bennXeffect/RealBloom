@@ -1607,6 +1607,9 @@ void layoutDiffraction()
     // control, but what you actually want to say is "give me a 512px kernel",
     // so drive the multiplier from the target size instead of the other way round.
     {
+        static constexpr int KERNEL_DIM_MIN = 4;
+        static constexpr int KERNEL_DIM_MAX = 8192;
+
         CmImage* diffInputSrc = diff.getImgInputSrc();
         const uint32_t srcW = diffInputSrc->getWidth();
         const uint32_t srcH = diffInputSrc->getHeight();
@@ -1621,23 +1624,40 @@ void layoutDiffraction()
         static int reqW = 0;
         static int reqH = 0;
         static bool editing = false;
+        static bool linkDims = true;
+        static bool hasRequest = false;   // an explicit target the user asked for
+        static uint32_t lastSrcW = 0;
+        static uint32_t lastSrcH = 0;
 
-        // Track the real size unless the user is mid-edit
-        if (!editing)
+        // A 1x1 placeholder is not a real image
+        const bool hasSource = (srcW > 1) || (srcH > 1);
+        const bool srcChanged = (srcW != lastSrcW) || (srcH != lastSrcH);
+        lastSrcW = srcW;
+        lastSrcH = srcH;
+
+        // If the size changed from somewhere else (the Resize slider), stop
+        // forcing our target and follow along again.
+        if (!editing && hasRequest && !srcChanged
+            && (((int)resizedW != reqW) || ((int)resizedH != reqH)))
+            hasRequest = false;
+
+        // Track the live size, unless the user is typing or waiting on an image
+        if (!editing && !hasRequest)
         {
             reqW = (int)resizedW;
             reqH = (int)resizedH;
         }
 
-        static bool linkDims = true;
-
-        bool apply = false;
+        bool stillEditing = false;
         ImGui::PushItemWidth(90.0f * Config::UI_SCALE);
         const bool wEdited = ImGui::InputInt("Width##DiffOut", &reqW, 0, 0,
             ImGuiInputTextFlags_EnterReturnsTrue);
+        stillEditing |= ImGui::IsItemActive() || ImGui::IsItemFocused();
         const bool hEdited = ImGui::InputInt("Height##DiffOut", &reqH, 0, 0,
             ImGuiInputTextFlags_EnterReturnsTrue);
+        stillEditing |= ImGui::IsItemActive() || ImGui::IsItemFocused();
         ImGui::PopItemWidth();
+        editing = stillEditing;
 
         ImGui::Checkbox("Link W/H##DiffOut", &linkDims);
         if (ImGui::IsItemHovered())
@@ -1653,27 +1673,38 @@ void layoutDiffraction()
                 reqW = (int)std::max(1.0f, roundf((float)reqH / std::max(0.0001f, aspect)));
         }
 
-        if (wEdited || hEdited)
-            apply = true;
-
-        editing = ImGui::IsItemActive() || ImGui::IsItemFocused();
-
+        bool apply = wEdited || hEdited;
         if (ImGui::Button("Apply Size##DiffOut", btnSize()))
             apply = true;
 
-        if (apply && (srcW > 0) && (srcH > 0))
+        // What gets stored is a MULTIPLIER of the cropped source, so it stops
+        // meaning the requested size as soon as the source changes. Re-derive it.
+        // Without this, setting a size with no image loaded stored a multiplier
+        // against the 1x1 placeholder, and dropping a real image then asked for a
+        // ~500000px output and killed the app.
+        if (hasRequest && hasSource && srcChanged)
+            apply = true;
+
+        if (apply)
         {
-            reqW = std::clamp(reqW, 4, 16384);
-            reqH = std::clamp(reqH, 4, 16384);
+            reqW = std::clamp(reqW, KERNEL_DIM_MIN, KERNEL_DIM_MAX);
+            reqH = std::clamp(reqH, KERNEL_DIM_MIN, KERNEL_DIM_MAX);
+            hasRequest = true;
 
-            // Resize multiplies the CROPPED size, so derive it from that
-            diffParams->inputTransformParams.cropResize.resize[0] =
-                (float)reqW / (float)std::max(1u, croppedW);
-            diffParams->inputTransformParams.cropResize.resize[1] =
-                (float)reqH / (float)std::max(1u, croppedH);
+            // Only meaningful once there is something to scale. Until then the
+            // request is just remembered.
+            if (hasSource)
+            {
+                // The +0.5 keeps the floor() inside getOutputDimensions from
+                // landing one pixel short of the requested size.
+                diffParams->inputTransformParams.cropResize.resize[0] =
+                    ((float)reqW + 0.5f) / (float)std::max(1u, croppedW);
+                diffParams->inputTransformParams.cropResize.resize[1] =
+                    ((float)reqH + 0.5f) / (float)std::max(1u, croppedH);
 
-            diffInputUpdated = true;
-            editing = false;
+                diffInputUpdated = true;
+                editing = false;
+            }
         }
 
         // The FFT pads an even dimension by one so the pattern centre lands
@@ -1682,7 +1713,10 @@ void layoutDiffraction()
         const uint32_t fftH = (resizedH % 2 == 0) ? (resizedH + 1) : resizedH;
 
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-        ImGui::TextWrapped("Source %ux%u -> kernel %ux%u", srcW, srcH, fftW, fftH);
+        if (hasSource)
+            ImGui::TextWrapped("Source %ux%u -> kernel %ux%u", srcW, srcH, fftW, fftH);
+        else
+            ImGui::TextWrapped("No input image yet. This size is applied once one is loaded.");
         ImGui::PopStyleColor();
     }
 
