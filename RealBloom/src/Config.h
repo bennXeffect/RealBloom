@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <string>
 #include <cstdint>
+#include <map>
 
 #include <pugixml/pugixml.hpp>
 
@@ -35,7 +36,14 @@ public:
     static void load();
     static void save();
 
+    // Small persisted UI flags: collapsed sections, chosen workflow, and so on.
+    // ImGui already persists window geometry and docking to imgui.ini, and the
+    // scale lives above, but tree node state is in-memory only.
+    static int getUIState(const std::string& key, int defaultValue);
+    static void setUIState(const std::string& key, int value);
+
 private:
     static std::string CFG_FILENAME;
+    static std::map<std::string, int> UI_STATE;
 
 };

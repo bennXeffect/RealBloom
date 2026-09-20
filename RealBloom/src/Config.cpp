@@ -19,6 +19,19 @@ const char* Config::DOCS_URL = "https://github.com/bean-mhm/realbloom/blob/main/
 // Variable
 float Config::UI_SCALE = 1.0f;
 
+std::map<std::string, int> Config::UI_STATE;
+
+int Config::getUIState(const std::string& key, int defaultValue)
+{
+    const auto it = UI_STATE.find(key);
+    return (it == UI_STATE.end()) ? defaultValue : it->second;
+}
+
+void Config::setUIState(const std::string& key, int value)
+{
+    UI_STATE[key] = value;
+}
+
 void Config::load()
 {
     std::string stage = "";
@@ -54,6 +67,16 @@ void Config::load()
                 UI_SCALE = std::stof(scaleValue);
                 UI_SCALE = fminf(fmaxf(Config::UI_SCALE, Config::UI_MIN_SCALE), Config::UI_MAX_SCALE);
             }
+
+            // UI state
+            stage = "Interface/State";
+            UI_STATE.clear();
+            for (pugi::xml_node item : interfaceNode.child("State").children("Item"))
+            {
+                const std::string name = item.attribute("name").as_string();
+                if (!name.empty())
+                    UI_STATE[name] = item.attribute("value").as_int(0);
+            }
         }
     }
     catch (const std::exception& e)
@@ -86,6 +109,15 @@ void Config::save()
             // Scale
             pugi::xml_node scaleNode = interfaceNode.append_child("Scale");
             scaleNode.append_child(pugi::node_pcdata).set_value(strFormat("%f", UI_SCALE).c_str());
+
+            // UI state
+            pugi::xml_node stateNode = interfaceNode.append_child("State");
+            for (const auto& kv : UI_STATE)
+            {
+                pugi::xml_node item = stateNode.append_child("Item");
+                item.append_attribute("name").set_value(kv.first.c_str());
+                item.append_attribute("value").set_value(kv.second);
+            }
         }
 
         // Write to the file
