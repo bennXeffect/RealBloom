@@ -1207,7 +1207,7 @@ void layoutMisc()
     imGuiBold("INTERFACE");
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-    ImGui::TextWrapped("Tip: Ctrl+Click any slider to type an exact value. Mouse wheel over a slider nudges it by 1%%.");
+    ImGui::TextWrapped("Tip: Ctrl+Click any slider to type an exact value. Ctrl+Wheel over one, or hold it and wheel, nudges by 1%%.");
     ImGui::PopStyleColor();
 
 
@@ -1629,15 +1629,32 @@ void layoutDiffraction()
             reqH = (int)resizedH;
         }
 
+        static bool linkDims = true;
+
         bool apply = false;
         ImGui::PushItemWidth(90.0f * Config::UI_SCALE);
-        if (ImGui::InputInt("Width##DiffOut", &reqW, 0, 0,
-            ImGuiInputTextFlags_EnterReturnsTrue))
-            apply = true;
-        if (ImGui::InputInt("Height##DiffOut", &reqH, 0, 0,
-            ImGuiInputTextFlags_EnterReturnsTrue))
-            apply = true;
+        const bool wEdited = ImGui::InputInt("Width##DiffOut", &reqW, 0, 0,
+            ImGuiInputTextFlags_EnterReturnsTrue);
+        const bool hEdited = ImGui::InputInt("Height##DiffOut", &reqH, 0, 0,
+            ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::PopItemWidth();
+
+        ImGui::Checkbox("Link W/H##DiffOut", &linkDims);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Keep the source aspect ratio when changing either value.");
+
+        // Mirror the edited field into the other one before applying
+        if (linkDims && (croppedW > 0) && (croppedH > 0))
+        {
+            const float aspect = (float)croppedH / (float)croppedW;
+            if (wEdited)
+                reqH = (int)std::max(1.0f, roundf((float)reqW * aspect));
+            else if (hEdited)
+                reqW = (int)std::max(1.0f, roundf((float)reqH / std::max(0.0001f, aspect)));
+        }
+
+        if (wEdited || hEdited)
+            apply = true;
 
         editing = ImGui::IsItemActive() || ImGui::IsItemFocused();
 
@@ -2005,11 +2022,23 @@ void imGuiText(const std::string& s, bool isError, bool newLine)
 // Fine-adjust the last item with the mouse wheel, 1% of its range per notch.
 // SetItemKeyOwner claims the wheel while hovered so the surrounding panel
 // does not scroll at the same time.
+// True only for a deliberate wheel edit: the slider is being held, or Ctrl is
+// down while hovering it. Plain hover must never consume the wheel, otherwise
+// scrolling a panel silently edits whatever slider the cursor passes over.
+static bool wheelEditAllowed()
+{
+    return ImGui::IsItemActive()
+        || (ImGui::IsItemHovered() && ImGui::GetIO().KeyCtrl);
+}
+
 bool imGuiWheelAdjust(float* v, float vMin, float vMax)
 {
-    ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
-    if (!ImGui::IsItemHovered())
+    if (!wheelEditAllowed())
         return false;
+
+    // Claim the wheel only once the edit is deliberate, so the panel keeps
+    // scrolling normally the rest of the time.
+    ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
 
     float wheel = ImGui::GetIO().MouseWheel;
     if (wheel == 0.0f)
@@ -2034,9 +2063,9 @@ bool imGuiSliderUInt(const std::string& label, uint32_t* v, uint32_t min, uint32
     bool changed = ImGui::SliderInt(label.c_str(), &vInt, u32ToI32(min), u32ToI32(max));
 
     // Mouse wheel: 1% of the range per notch, but never less than 1
-    ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
-    if (ImGui::IsItemHovered())
+    if (wheelEditAllowed())
     {
+        ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY);
         float wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.0f)
         {
