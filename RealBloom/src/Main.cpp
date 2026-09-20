@@ -33,6 +33,7 @@ static const ImVec4 colorActionActive{ 0.10f, 0.32f, 0.44f, 1.0f };
 static float moduleFooterHeight(bool withCancel);
 static bool imGuiActionButton(const char* label);
 static bool imGuiSection(const char* label, const char* key);
+static void persistSettings(bool saving);
 static const ImVec4 colorWarningText{ 0.940f, 0.578f, 0.282f, 1.0f };
 static const ImVec4 colorErrorText{ 0.950f, 0.300f, 0.228f, 1.0f };
 
@@ -42,7 +43,10 @@ static std::vector<std::string> slotNames;
 std::vector<std::string> loadableSlotNames;
 std::vector<uint32_t> loadableSlotIndices;
 static int selSlotIndex = 0;
-static std::string selSlotID = ""; // will be updated externally, causing the index to update
+// Set this to move the selection. Deliberately only ever written in response to a
+// direct user action: computing or previewing must not yank the view somewhere
+// else, since the split viewer already shows every slot at once.
+static std::string selSlotID = "";
 static float imageZoom = 1.0f;
 static ImVec2 imagePan{ 0.0f, 0.0f };   // single-view offset, in screen pixels
 static bool viewerRecenter = true;      // recentre the single view on next layout
@@ -233,6 +237,10 @@ int main(int argc, char** argv)
 
     // Color Managed Image IO
     CmImageIO::init();
+
+    // Restore saved settings now that the modules and CMS hold their defaults
+    if (!CLI::Interface::active())
+        persistSettings(false);
 
     // GUI-specific
     if (!CLI::Interface::active())
@@ -445,7 +453,6 @@ static void moveSlotContent(int srcIndex, int dstIndex, bool preserveOriginal)
         src.viewImage->moveContent(*dst.viewImage, preserveOriginal);
     }
 
-    selSlotID = dst.id;
 }
 
 // Right-click menu shared by the split panes and the single view.
@@ -1192,7 +1199,6 @@ void layoutColorManagement()
         {
             tableChanged = false;
             cmfPreviewError = "";
-            selSlotID = "disp-result";
 
             disp.cancel();
             try
@@ -1374,7 +1380,6 @@ void layoutConvolution()
         convInputUpdated = false;
         conv.previewInput();
         conv.previewThreshold();
-        selSlotID = "cv-input";
     }
 
     if (curSlotId == "cv-kernel")
@@ -1389,7 +1394,6 @@ void layoutConvolution()
     {
         convKernelUpdated = false;
         conv.previewKernel();
-        selSlotID = "cv-kernel";
     }
 
     if (curSlotId == "cv-kernel")
@@ -1440,7 +1444,6 @@ void layoutConvolution()
     {
         convThresholdUpdated = false;
         conv.previewThreshold();
-        selSlotID = "cv-prev";
     }
 
     ImGui::Checkbox("Auto-Exposure##Conv", &convParams->autoExposure);
@@ -1528,7 +1531,6 @@ void layoutConvolution()
     {
         convBlendParamsUpdated = false;
         conv.blend();
-        selSlotID = "cv-result";
     }
 
     ImGui::EndChild();
@@ -1538,7 +1540,6 @@ void layoutConvolution()
         imgConvResult.resize(imgConvInput.getWidth(), imgConvInput.getHeight(), true);
         imgConvResult.fill(std::array<float, 4>{ 0, 0, 0, 1 }, true);
         imgConvResult.moveToGPU();
-        selSlotID = "cv-result";
 
         conv.convolve();
     }
@@ -1578,7 +1579,6 @@ void layoutDispersion()
     {
         dispInputUpdated = false;
         disp.previewInput();
-        selSlotID = "disp-input";
         dispInputChanged = true;
     }
 
@@ -1619,21 +1619,18 @@ void layoutDispersion()
 
     const uint64_t dispCost =
         (uint64_t)dispParams->steps * (uint64_t)dispInW * (uint64_t)dispInH;
-    const uint64_t dispBudget =
-        (dispParams->methodInfo.method == RealBloom::DispersionMethod::GPU)
-        ? 400000000ull : 100000000ull;
-    const bool dispTooHeavy = (dispCost > dispBudget);
+    // The GPU method is fast enough that the budget is pointless: 1024 steps on a
+    // 1024x1024 input lands in about 0.2s. Only the CPU path needs a ceiling.
+    const bool dispOnGpu =
+        (dispParams->methodInfo.method == RealBloom::DispersionMethod::GPU);
+    const bool dispTooHeavy = !dispOnGpu && (dispCost > 100000000ull);
 
-    auto applyDispersion = [&](bool focusResult)
+    auto applyDispersion = [&]()
     {
         imgDispResult.resize(dispInW, dispInH, true);
         imgDispResult.fill(std::array<float, 4>{ 0, 0, 0, 1 }, true);
         imgDispResult.moveToGPU();
 
-        // A live re-run must not steal the selection; the split viewer already
-        // shows the result alongside the input.
-        if (focusResult)
-            selSlotID = "disp-result";
 
         disp.compute();
     };
@@ -1670,7 +1667,7 @@ void layoutDispersion()
             && (getElapsedMs(lastChangeTime) > 200))
         {
             pending = false;
-            applyDispersion(false);
+            applyDispersion();
         }
     }
 
@@ -1683,7 +1680,7 @@ void layoutDispersion()
     ImGui::EndChild();
 
     if (imGuiActionButton("Apply Dispersion##Disp"))
-        applyDispersion(true);
+        applyDispersion();
 
     if (disp.getStatus().isWorking())
     {
@@ -1711,11 +1708,12 @@ void layoutDiffraction()
             diffInputUpdated = true;
     }
 
+    bool diffInputChanged = false;
     if (diffInputUpdated)
     {
         diffInputUpdated = false;
+        diffInputChanged = true;
         diff.previewInput();
-        selSlotID = "diff-input";
     }
 
     imGuiDiv();
@@ -1844,6 +1842,56 @@ void layoutDiffraction()
 
     ImGui::Checkbox("Logarithmic Normalization##Diff", &diffParams->logNorm);
 
+    // Live preview.
+    //
+    // Unlike dispersion, Diffraction::compute() runs synchronously on the UI
+    // thread, so every automatic run is a visible pause. Measured on this
+    // machine: ~0.08s at 256x256, ~0.22s at 512x512, ~0.5s at 1024x1024. Past a
+    // megapixel that pause stops being acceptable, so the button takes over.
+    static bool diffLive = (Config::getUIState("diff.live", 1) != 0);
+    if (ImGui::Checkbox("Live##Diff", &diffLive))
+        Config::setUIState("diff.live", diffLive ? 1 : 0);
+
+    {
+        CmImage* diffSrc = diff.getImgInputSrc();
+        uint32_t liveW = 1, liveH = 1;
+        ImageTransform::getOutputDimensions(
+            diffParams->inputTransformParams,
+            diffSrc->getWidth(), diffSrc->getHeight(), liveW, liveH);
+
+        const bool diffHasInput = (diffSrc->getWidth() > 1) || (diffSrc->getHeight() > 1);
+        const bool diffTooHeavy =
+            ((uint64_t)liveW * (uint64_t)liveH) > (1024ull * 1024ull);
+
+        // Re-run once the parameters have been stable for a moment
+        static bool lastLogNorm = false;
+        static uint32_t lastW = 0;
+        static uint32_t lastH = 0;
+        static auto lastChangeTime = std::chrono::system_clock::now();
+        static bool pending = false;
+
+        if ((diffParams->logNorm != lastLogNorm)
+            || (liveW != lastW) || (liveH != lastH)
+            || diffInputChanged)
+        {
+            lastLogNorm = diffParams->logNorm;
+            lastW = liveW;
+            lastH = liveH;
+            lastChangeTime = std::chrono::system_clock::now();
+            pending = true;
+        }
+
+        if (pending && diffLive && diffHasInput && !diffTooHeavy
+            && (getElapsedMs(lastChangeTime) > 250))
+        {
+            pending = false;
+            diff.compute();
+        }
+
+        if (diffLive && diffHasInput && diffTooHeavy)
+            imGuiText("Live paused above 1024x1024. Use Compute.", false, false);
+    }
+
     // The pattern is the Fourier transform of the aperture, so aperture size and
     // pattern size are reciprocal. This surprises people, so say it out loud.
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
@@ -1860,7 +1908,6 @@ void layoutDiffraction()
 
     if (imGuiActionButton("Compute##Diff"))
     {
-        selSlotID = "diff-result";
         diff.compute();
     }
 }
@@ -2668,8 +2715,188 @@ void applyStyle_RealBloomGray()
     style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.0, 0.0, 0.0, 0.4705882370471954);
 }
 
+// Settings persistence.
+//
+// One function handles both directions so the save and load lists cannot drift
+// apart, which is how this kind of code usually rots. Images are deliberately
+// not persisted; everything else the UI exposes is.
+static void cfgFloat(const std::string& key, float& v, bool saving)
+{
+    if (saving) Config::setUIFloat(key, v);
+    else v = Config::getUIFloat(key, v);
+}
+
+static void cfgBool(const std::string& key, bool& v, bool saving)
+{
+    if (saving) Config::setUIState(key, v ? 1 : 0);
+    else v = (Config::getUIState(key, v ? 1 : 0) != 0);
+}
+
+static void cfgUInt(const std::string& key, uint32_t& v, bool saving)
+{
+    if (saving) Config::setUIState(key, (int)v);
+    else v = (uint32_t)std::max(0, Config::getUIState(key, (int)v));
+}
+
+static void cfgEnum(const std::string& key, int& v, int count, bool saving)
+{
+    if (saving) Config::setUIState(key, v);
+    else v = std::clamp(Config::getUIState(key, v), 0, count - 1);
+}
+
+// Only restore a colour space / display / view if the current config still has
+// it. OCIO configs can be swapped out, and a stale name is worse than a default.
+static void cfgListed(const std::string& key, const std::vector<std::string>& allowed,
+    std::string& v, bool saving)
+{
+    if (saving)
+    {
+        Config::setUIString(key, v);
+        return;
+    }
+
+    const std::string stored = Config::getUIString(key, "");
+    if (stored.empty())
+        return;
+
+    if (std::find(allowed.begin(), allowed.end(), stored) != allowed.end())
+        v = stored;
+}
+
+static void cfgTransform(const std::string& p, ImageTransformParams& t, bool sv)
+{
+    cfgFloat(p + ".cropX", t.cropResize.crop[0], sv);
+    cfgFloat(p + ".cropY", t.cropResize.crop[1], sv);
+    cfgFloat(p + ".resizeX", t.cropResize.resize[0], sv);
+    cfgFloat(p + ".resizeY", t.cropResize.resize[1], sv);
+    cfgFloat(p + ".crOriginX", t.cropResize.origin[0], sv);
+    cfgFloat(p + ".crOriginY", t.cropResize.origin[1], sv);
+
+    cfgFloat(p + ".scaleX", t.transform.scale[0], sv);
+    cfgFloat(p + ".scaleY", t.transform.scale[1], sv);
+    cfgFloat(p + ".rotate", t.transform.rotate, sv);
+    cfgFloat(p + ".translateX", t.transform.translate[0], sv);
+    cfgFloat(p + ".translateY", t.transform.translate[1], sv);
+    cfgFloat(p + ".trOriginX", t.transform.origin[0], sv);
+    cfgFloat(p + ".trOriginY", t.transform.origin[1], sv);
+
+    cfgFloat(p + ".filterR", t.color.filter[0], sv);
+    cfgFloat(p + ".filterG", t.color.filter[1], sv);
+    cfgFloat(p + ".filterB", t.color.filter[2], sv);
+    cfgFloat(p + ".exposure", t.color.exposure, sv);
+    cfgFloat(p + ".contrast", t.color.contrast, sv);
+    cfgFloat(p + ".grayscaleMix", t.color.grayscaleMix, sv);
+
+    int cgt = (int)t.color.contrastGrayscaleType;
+    cfgEnum(p + ".contrastGray", cgt, (int)GrayscaleType_EnumSize, sv);
+    t.color.contrastGrayscaleType = (GrayscaleType)cgt;
+
+    int gt = (int)t.color.grayscaleType;
+    cfgEnum(p + ".grayscale", gt, (int)GrayscaleType_EnumSize, sv);
+    t.color.grayscaleType = (GrayscaleType)gt;
+
+    cfgBool(p + ".transparency", t.transparency, sv);
+}
+
+static void persistSettings(bool saving)
+{
+    // Diffraction
+    {
+        RealBloom::DiffractionParams* d = diff.getParams();
+        cfgBool("diff.logNorm", d->logNorm, saving);
+        cfgTransform("diff.in", d->inputTransformParams, saving);
+    }
+
+    // Dispersion
+    {
+        RealBloom::DispersionParams* d = disp.getParams();
+        cfgFloat("disp.amount", d->amount, saving);
+        cfgFloat("disp.edgeOffset", d->edgeOffset, saving);
+        cfgUInt("disp.steps", d->steps, saving);
+        cfgUInt("disp.threads", d->methodInfo.numThreads, saving);
+
+        int m = (int)d->methodInfo.method;
+        cfgEnum("disp.method", m, (int)RealBloom::DispersionMethod_EnumSize, saving);
+        d->methodInfo.method = (RealBloom::DispersionMethod)m;
+
+        cfgTransform("disp.in", d->inputTransformParams, saving);
+    }
+
+    // Convolution
+    {
+        RealBloom::ConvolutionParams* c = conv.getParams();
+        cfgFloat("conv.threshold", c->threshold, saving);
+        cfgFloat("conv.knee", c->knee, saving);
+        cfgBool("conv.autoExposure", c->autoExposure, saving);
+        cfgBool("conv.kernelOrigin", c->useKernelTransformOrigin, saving);
+
+        cfgBool("conv.blendAdditive", c->blendAdditive, saving);
+        cfgFloat("conv.blendInput", c->blendInput, saving);
+        cfgFloat("conv.blendConv", c->blendConv, saving);
+        cfgFloat("conv.blendMix", c->blendMix, saving);
+        cfgFloat("conv.blendExposure", c->blendExposure, saving);
+
+        int m = (int)c->methodInfo.method;
+        cfgEnum("conv.method", m, (int)RealBloom::ConvolutionMethod_EnumSize, saving);
+        c->methodInfo.method = (RealBloom::ConvolutionMethod)m;
+
+        cfgBool("conv.deconvolve", c->methodInfo.FFT_CPU_deconvolve, saving);
+        cfgUInt("conv.naiveThreads", c->methodInfo.NAIVE_CPU_numThreads, saving);
+        cfgUInt("conv.gpuChunks", c->methodInfo.NAIVE_GPU_numChunks, saving);
+        cfgUInt("conv.gpuChunkSleep", c->methodInfo.NAIVE_GPU_chunkSleep, saving);
+
+        cfgTransform("conv.in", c->inputTransformParams, saving);
+        cfgTransform("conv.kernel", c->kernelTransformParams, saving);
+    }
+
+    // Colour management. These go through accessors rather than plain fields.
+    {
+        float exposure = CMS::getExposure();
+        cfgFloat("cms.exposure", exposure, saving);
+        if (!saving) CMS::setExposure(exposure);
+
+        std::string display = CMS::getActiveDisplay();
+        cfgListed("cms.display", CMS::getDisplays(), display, saving);
+        if (!saving) CMS::setActiveDisplay(display);
+
+        std::string view = CMS::getActiveView();
+        cfgListed("cms.view", CMS::getViews(), view, saving);
+        if (!saving) CMS::setActiveView(view);
+
+        std::string look = CMS::getActiveLook();
+        cfgListed("cms.look", CMS::getLooks(), look, saving);
+        if (!saving) CMS::setActiveLook(look);
+    }
+
+    // Image IO
+    {
+        std::string inSpace = CmImageIO::getInputSpace();
+        cfgListed("io.input", CMS::getColorSpaces(), inSpace, saving);
+        if (!saving) CmImageIO::setInputSpace(inSpace);
+
+        std::string outSpace = CmImageIO::getOutputSpace();
+        cfgListed("io.output", CMS::getColorSpaces(), outSpace, saving);
+        if (!saving) CmImageIO::setOutputSpace(outSpace);
+
+        std::string nlSpace = CmImageIO::getNonLinearSpace();
+        cfgListed("io.nonLinear", CMS::getColorSpaces(), nlSpace, saving);
+        if (!saving) CmImageIO::setNonLinearSpace(nlSpace);
+
+        bool autoDetect = CmImageIO::getAutoDetect();
+        cfgBool("io.autoDetect", autoDetect, saving);
+        if (!saving) CmImageIO::setAutoDetect(autoDetect);
+
+        bool applyView = CmImageIO::getApplyViewTransform();
+        cfgBool("io.applyView", applyView, saving);
+        if (!saving) CmImageIO::setApplyViewTransform(applyView);
+    }
+}
+
 void cleanUp()
 {
+    if (!CLI::Interface::active())
+        persistSettings(true);
+
     Config::save();
 
     if (!CLI::Interface::active() && convResUsageThread)
