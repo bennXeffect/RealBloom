@@ -390,7 +390,7 @@ void CmImageIO::writeImage(CmImage& source, const std::string& filename)
         // Embed the color space name
         if ((!viewTransform) && contains(getMetaExtensions(), extension))
         {
-            spec.attribute(attribNameColorSpace, OIIO::TypeDesc::TypeString, csName);
+            spec.attribute(attribNameColorSpace, OIIO::TypeString, csName);
         }
 
         // Write the image

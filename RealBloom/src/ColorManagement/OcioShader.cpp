@@ -180,7 +180,8 @@ void OcioShader::prepareLuts()
         uint32_t height = 0;
         OCIO::GpuShaderDesc::TextureType channel = OCIO::GpuShaderDesc::TEXTURE_RGB_CHANNEL;
         OCIO::Interpolation interpolation = OCIO::INTERP_LINEAR;
-        m_shaderDesc->getTexture(idx, textureName, samplerName, width, height, channel, interpolation);
+        OCIO::GpuShaderDesc::TextureDimensions dimensions = OCIO::GpuShaderDesc::TEXTURE_1D;
+        m_shaderDesc->getTexture(idx, textureName, samplerName, width, height, channel, dimensions, interpolation);
 
         if (!textureName || !*textureName
             || !samplerName || !*samplerName
